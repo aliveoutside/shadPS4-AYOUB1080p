@@ -153,6 +153,23 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
+        /// State of every subresource when the image stopped being uniform. Subresources that
+        /// are not in dirty_subresources still have it.
+        State partial_base_state;
+        /// Subresources changed since the image stopped being uniform (bounded, see overflow).
+        boost::container::small_vector<u32, 16> dirty_subresources;
+        bool dirty_overflow{};
+        /// Incremented on every per subresource state change.
+        u64 state_version{};
+        /// Last partial transition, a repeat of it with no state change in between is a no-op.
+        struct {
+            SubresourceRange range;
+            vk::ImageLayout layout;
+            vk::AccessFlags2 access;
+            vk::PipelineStageFlags2 stage;
+            u64 version;
+            bool valid;
+        } last_partial{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;

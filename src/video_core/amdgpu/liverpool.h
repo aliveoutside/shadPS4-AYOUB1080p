@@ -19,6 +19,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/amdgpu/scout.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -29,6 +30,8 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+struct PM4CmdWaitRegMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -60,6 +63,10 @@ struct Liverpool {
     };
 
     Regs regs{};
+    std::unique_ptr<Scout> scout;
+    std::shared_ptr<ScoutSubmission> scout_submission;
+    const ScoutDraw* current_scout_draw{};
+    u64 gfx_submit_seq{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 
@@ -70,13 +77,9 @@ public:
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
-    void SubmitDone() noexcept {
-        std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
-        submit_done = true;
-        submit_cv.notify_one();
-    }
+    /// End of a guest frame. Also measures how many guest frames the command processor is
+    /// behind, and optionally waits for it to catch up (see Tuning::max_gpu_lag_frames).
+    void SubmitDone() noexcept;
 
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
@@ -93,6 +96,36 @@ public:
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
+    }
+
+    /// Starts the scout thread (Tuning::scout), which reads the graphics submissions ahead of
+    /// the command processor and precomputes the draws for the client.
+    void StartScout(ScoutClient& client);
+
+    /// Stops it (before the client goes away).
+    void StopScout() {
+        scout.reset();
+    }
+
+    const Scout* GetScout() const noexcept {
+        return scout.get();
+    }
+
+    /// The scout entry of the draw the command processor is processing, null when none.
+    const ScoutDraw* CurrentScoutDraw() const noexcept {
+        return current_scout_draw;
+    }
+
+    /// The scout entry of the draw packet after the current one, when already published (its
+    /// lookups can be prefetched a draw ahead), null when none.
+    const ScoutDraw* PeekNextScoutDraw() const noexcept {
+        return scout_submission ? scout_submission->Peek() : nullptr;
+    }
+
+    /// Context, config and uconfig register writes that changed a value so far (command
+    /// processor thread).
+    u64 ContextRegChanges() const noexcept {
+        return context_reg_changes;
     }
 
     template <bool wait_done = false>
@@ -127,6 +160,11 @@ public:
 
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
+    }
+
+    /// The queue whose commands the command processor is processing: 0 graphics, 1+ compute.
+    [[nodiscard]] s32 CurrentQueue() const noexcept {
+        return curr_qid;
     }
 
     struct AscQueueInfo {
@@ -185,13 +223,34 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 scout_seq = 0);
+    void BeginScoutDraw(const void* packet);
+    void EndScoutDraw();
     Task ProcessCeUpdate(std::span<const u32> ccb);
+    /// submit_ns: when the guest submitted the work (top level submissions only, for statistics).
     template <bool is_indirect = false>
-    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid, u64 submit_ns = 0);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+
+    /// Remembers values the command processor wrote at small addresses (labels, fences), so a
+    /// wait satisfied by one of them is not mistaken for a guest CPU signal.
+    void RecordCpLabel(VAddr address, const void* data, u32 num_bytes);
+    /// Same, for a command processor write of guest memory: copies taken before may be stale.
+    void NoteCpWrite(VAddr address, const void* data, u32 num_bytes);
+    /// Writes emulated depth block sample counters for an occlusion counter dump: they grow at
+    /// each dump, so every query sees samples visible.
+    void WriteEmulatedOcclusionCounters(VAddr address);
+    /// Whether the value at the address is the last one the command processor wrote there.
+    bool IsWrittenByCp(VAddr address) const;
+    /// Starts a new upload epoch when the satisfied wait may have been released by the guest CPU
+    /// (which writes the data the following commands read before the value they wait for).
+    void OnWaitRegMemSatisfied(const PM4CmdWaitRegMem& wait);
+    /// A wait for the results of an occlusion query counted by the GPU is satisfied at once when
+    /// the value waited for does not depend on the samples counted (valid bits): the commands that
+    /// follow run after the GPU wrote the results, reading them back would wait for the GPU.
+    bool SkipOcclusionWait(const PM4CmdWaitRegMem& wait);
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -232,6 +291,16 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    /// Asynchronous compute submissions not fully processed yet. The PS4 runs them alongside the
+    /// graphics queue; here the graphics queue can give way to them (Tuning::asc_yield_packets).
+    std::atomic<u32> asc_submits{};
+    /// Submissions queued by the guest and fully processed by the command processor (monotonic),
+    /// and the number queued at the end of each recent guest frame.
+    std::atomic<u64> submits_issued{};
+    std::atomic<u64> submits_completed{};
+    static constexpr size_t NumFrameMarks = 16;
+    std::array<u64, NumFrameMarks> frame_marks{};
+    u64 frame_index{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
@@ -242,6 +311,28 @@ private:
     u32 gpu_tid;
 #endif
     s32 curr_qid{-1};
+    /// Packets and commands processed by the command processor thread, used to tell work from
+    /// spinning on unsatisfied waits. Only accessed by that thread, counted at every packet: on
+    /// a cache line of its own, away from the fields guest threads write when they submit
+    /// (counting there waited for that line to come back from their cores).
+    alignas(64) u64 processed_packets{};
+    /// Graphics packets processed since the graphics queue last gave way to compute work. Only
+    /// accessed by the command processor thread.
+    u32 gfx_packets_since_yield{};
+    /// Context, config and uconfig register writes that changed a value (and state clears), by
+    /// the command processor: draws with the count of the draw before have the same render
+    /// state. Only accessed by that thread.
+    u64 context_reg_changes{};
+    /// Time the command processor thread slept inside packets (flip label waits).
+    u64 blocked_ns{};
+    struct CpLabel {
+        VAddr address{};
+        u32 value{};
+    };
+    static constexpr size_t NumCpLabels = 1024;
+    /// Last values written by the command processor, indexed by dword address. Only accessed
+    /// by the command processor thread.
+    std::array<CpLabel, NumCpLabels> cp_labels{};
 };
 
 } // namespace AmdGpu

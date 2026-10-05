@@ -9,10 +9,12 @@
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
+#include "common/perf_stats.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/perf_sampler.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -37,10 +39,33 @@
 
 namespace VideoCore {
 
+namespace {
+/// Deferred protection (PageManager::DeferProtect): page ranges [first, end) whose new write
+/// protection the calling thread leaves to RefreshDeferredProtect.
+thread_local std::vector<std::pair<u64, u64>>* t_deferred_protect = nullptr;
+
+/// Late protection (PageManager::BeginLateProtect): the protections decided in the region lock
+/// section of the calling thread, and the page ranges [first, end) it keeps locked until they
+/// are applied.
+struct LateProtect {
+    struct Run {
+        VAddr address;
+        u64 size;
+        Core::MemoryPermission perms;
+    };
+    std::vector<Run> runs;
+    std::vector<std::pair<u64, u64>> locked;
+    bool active{};
+};
+thread_local LateProtect t_late_protect;
+} // Anonymous namespace
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
         u8 num_read_watchers;
+        /// The protection of the page does not match its watchers yet (deferred protection).
+        u8 protect_pending;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -115,7 +140,32 @@ struct PageManager::Impl {
         locks.reserve(start_page, end_page);
     }
 
+    /// Applies the protections of the late protection section of the calling thread and
+    /// unlocks its pages (the section stays begun).
+    void ApplyLateProtect() {
+        auto& late = t_late_protect;
+        for (const auto& run : late.runs) {
+            Protect(run.address, run.size, run.perms);
+        }
+        for (const auto& [first, end] : late.locked) {
+            for (u64 page = first; page != end; ++page) {
+                if (auto* lock = locks.find(page)) {
+                    lock->unlock();
+                }
+            }
+        }
+        if (!late.runs.empty()) {
+            Common::Perf::Add(Common::Perf::LateProtects, late.runs.size());
+        }
+        late.runs.clear();
+        late.locked.clear();
+    }
+
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
+        if (t_late_protect.active && !t_late_protect.locked.empty()) [[unlikely]] {
+            // Never expected in a region lock section: page locks are taken in order.
+            ApplyLateProtect();
+        }
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -165,8 +215,12 @@ struct PageManager::Impl {
                 ++potential_pages;
             }
 
+            // A deferred protection not applied yet is applied now.
+            const bool was_pending = state->protect_pending != 0;
+            state->protect_pending = 0;
+
             // If the page must be (un)protected
-            if (new_perms != old_perms) {
+            if (new_perms != old_perms || was_pending) {
                 if (range_pages == 0) {
                     // Start a new potential range
                     range_begin = page;
@@ -199,9 +253,29 @@ struct PageManager::Impl {
         u64 range_pages = 0;
         u64 potential_pages = 0;
 
+        // Protection added after an upload (against writes, and against reads of a range the
+        // GPU is about to write) can be left to another thread (deferred protection, see
+        // PageManager::DeferProtect); protection removed is applied at once.
+        const bool defer = t_deferred_protect != nullptr && write_op == PageOp::Track &&
+                           (read_op == PageOp::None || read_op == PageOp::Track);
+        // Late protection (PageManager::BeginLateProtect): the protections are applied once the
+        // caller released its region lock, the pages stay locked until then. Pages kept locked by
+        // an earlier call of the section are released first: page locks are always taken in
+        // address order by one call, never while holding others.
+        auto& late = t_late_protect;
+        if (late.active && !late.locked.empty()) {
+            ApplyLateProtect();
+        }
         const auto release_pending = [&] {
             if (range_pages > 0) {
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                if (defer) {
+                    t_deferred_protect->emplace_back(range_begin, range_begin + range_pages);
+                } else if (late.active) {
+                    late.runs.push_back({range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS,
+                                         perms});
+                } else {
+                    Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
             }
@@ -234,8 +308,19 @@ struct PageManager::Impl {
                 ++potential_pages;
             }
 
+            bool must_protect = new_perms != old_perms;
+            if (defer) {
+                if (must_protect) {
+                    state->protect_pending = 1;
+                }
+            } else if (state->protect_pending != 0) {
+                // A deferred protection not applied yet is applied now.
+                state->protect_pending = 0;
+                must_protect = true;
+            }
+
             // If the page must be (un)protected
-            if (new_perms != old_perms) {
+            if (must_protect) {
                 if (range_pages == 0) {
                     // Start a new potential range
                     range_begin = base_page + page;
@@ -249,11 +334,63 @@ struct PageManager::Impl {
         // Add pending (un)protect action
         release_pending();
 
+        if (late.active) {
+            // Unlocked by ApplyLateProtect, once the protections are applied.
+            late.locked.emplace_back(base_page + page_start, base_page + page_end);
+            return;
+        }
         for (u64 page = page_start; page != page_end; ++page) {
             if (auto* lock = locks.find(base_page + page)) {
                 lock->unlock();
             }
         }
+    }
+
+    /// Applies the deferred protections of the pages [page_start, page_end): the protection
+    /// their watchers need now, unless another change of their watchers applied it already.
+    u64 RefreshDeferredProtect(u64 page_start, u64 page_end) {
+        // Runs of consecutive pending pages needing the same protection: their pages stay locked
+        // until it is applied, then are unlocked.
+        Core::MemoryPermission perms{};
+        u64 run_begin = 0;
+        u64 run_pages = 0;
+        u64 num_protected = 0;
+        const auto flush_run = [&] {
+            if (run_pages > 0) {
+                Protect(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS, perms);
+                num_protected += run_pages;
+                for (u64 page = run_begin; page != run_begin + run_pages; ++page) {
+                    locks[page].unlock();
+                }
+                run_pages = 0;
+            }
+        };
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                flush_run();
+                continue;
+            }
+            locks[page].lock();
+            if (state->protect_pending == 0) {
+                // Applied already by another change of its watchers.
+                locks[page].unlock();
+                flush_run();
+                continue;
+            }
+            state->protect_pending = 0;
+            const auto page_perms = state->Perms();
+            if (run_pages > 0 && page_perms != perms) {
+                flush_run();
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+                perms = page_perms;
+            }
+            ++run_pages;
+        }
+        flush_run();
+        return num_protected;
     }
 
     struct PageTraits {
@@ -428,6 +565,8 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        Common::Perf::ScopedTimer protect_timer{Common::Perf::ProtectCalls,
+                                                Common::Perf::ProtectNs};
         impl.Protect(address, size, perms);
     }
 
@@ -437,9 +576,19 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            if (handled) {
+                Common::Perf::Add(Common::Perf::FaultWrites);
+            }
+            return handled;
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+            const bool handled = rasterizer->ReadMemory(addr, size, is_gpu_thread, rip);
+            if (handled) {
+                Common::Perf::Add(Common::Perf::FaultReads);
+                Core::PerfSampler::RecordReadback(addr, rip);
+            }
+            return handled;
         }
         return false;
     }
@@ -480,6 +629,28 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op) const {
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+}
+
+void PageManager::DeferProtect(std::vector<std::pair<u64, u64>>* deferred_pages) {
+    t_deferred_protect = deferred_pages;
+}
+
+u64 PageManager::RefreshDeferredProtect(u64 first_page, u64 end_page) const {
+    return impl->RefreshDeferredProtect(first_page, end_page);
+}
+
+bool PageManager::BeginLateProtect() const {
+    auto& late = t_late_protect;
+    if (late.active || !Common::Perf::GetTuning().late_protect.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    late.active = true;
+    return true;
+}
+
+void PageManager::EndLateProtect() const {
+    impl->ApplyLateProtect();
+    t_late_protect.active = false;
 }
 
 } // namespace VideoCore

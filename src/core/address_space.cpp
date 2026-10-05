@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#include "common/perf_stats.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -510,7 +513,16 @@ struct AddressSpace::Impl {
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
-        std::scoped_lock lk{mutex};
+        // Protect only reads the region list (Map and Unmap change it under the exclusive
+        // lock). With parallel_protect, protections of different threads run at the same time;
+        // those of a same page are ordered by the page locks of the callers (PageManager).
+        std::unique_lock<std::shared_mutex> exclusive_lock{mutex, std::defer_lock};
+        std::shared_lock<std::shared_mutex> shared_lock{mutex, std::defer_lock};
+        if (Common::Perf::GetTuning().parallel_protect.load(std::memory_order_relaxed)) {
+            shared_lock.lock();
+        } else {
+            exclusive_lock.lock();
+        }
         DWORD new_flags{};
 
         if (write && !read) {
@@ -575,7 +587,7 @@ struct AddressSpace::Impl {
         return reserved_regions;
     }
 
-    std::mutex mutex;
+    std::shared_mutex mutex;
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};

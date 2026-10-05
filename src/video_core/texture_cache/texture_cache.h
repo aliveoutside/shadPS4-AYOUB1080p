@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -12,6 +14,8 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/perf_stats.h"
+#include "video_core/amdgpu/cb_db_extent.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
@@ -50,6 +54,8 @@ class TextureCache {
         static constexpr bool NULL_CHECK = true;
     };
     using PageTable = Common::MultiLevelPageTable<Traits>;
+    static constexpr u64 NumImagePages = u64{1}
+                                         << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
 
 public:
     enum class BindingType : u32 {
@@ -117,10 +123,53 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// Frame x-ray: writes the image at the address (or overlapping it) to a raw file in the log
+    /// folder, waiting for the GPU. Returns false when no image is there.
+    /// Frame x-ray: writes the image at the address raw to the log folder (the one used most
+    /// recently among those there, or the one of the given size when width is not 0).
+    bool DumpImageToFile(VAddr address, std::string_view prefix, u32 width = 0, u32 height = 0);
+
+    /// Generation of the cache: grows whenever an image is registered, unregistered or replaced
+    /// (rebind needed), so that a binding found for a descriptor can be reused while the cache
+    /// does not change (Rasterizer texture binding memo). Lock free.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load(std::memory_order_acquire);
+    }
+
+    /// Generation of an image: grows whenever the guest (or a GPU copy) wrote its memory, so
+    /// that the image needs a refresh check before its next binding. Lock free.
+    [[nodiscard]] u32 ImageGeneration(ImageId image_id) const noexcept {
+        return image_id.index < NumImageGens
+                   ? image_gens[image_id.index].load(std::memory_order_acquire)
+                   : 0;
+    }
+
+    /// Garbage collector tick, one per guest frame (command processor thread).
+    [[nodiscard]] u64 GcTick() const noexcept {
+        return gc_tick;
+    }
+
+    /// The use order of the garbage collector, as FindImage updates it for an image it finds
+    /// (Rasterizer render target memo, once per frame and image).
+    void TouchImageLocked(ImageId image_id) {
+        std::scoped_lock lock{mutex};
+        TouchImage(slot_images[image_id]);
+    }
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
+        // Clean, and tracked over its whole range: nothing to do but touch it (bound every
+        // draw as a render target or texture: the lock is skipped). A guest write arriving
+        // this instant is seen by the next binding, as it would be with the lock.
+        if (Common::Perf::GetTuning().tex_memo.load(std::memory_order_relaxed) &&
+            False(image.flags & ImageFlagBits::Dirty) &&
+            image.track_addr == image.info.guest_address &&
+            image.track_addr_end == image.info.guest_address + image.info.guest_size) {
+            TouchImage(image);
+            return;
+        }
+        std::scoped_lock lk{mutex};
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
@@ -139,6 +188,17 @@ public:
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
+    /**
+     * Render targets of games that do not give the size hint of the command stream are created
+     * with the pitch and aligned height of their buffer. A texture descriptor of the same buffer
+     * tells the real size (Tuning::rt_size_learn): the target is then shrunk to it (its content
+     * kept), and targets bound later at this address take this size, so that sampling the
+     * target with normalized coordinates covers exactly the rendered area, not the padding.
+     */
+    [[nodiscard]] AmdGpu::CbDbExtent LearnedTargetExtent(VAddr address, u32 pitch) const;
+    [[nodiscard]] ImageId LearnTargetSize(ImageId image_id, const ImageInfo& tsharp_info);
+    [[nodiscard]] ImageId ShrinkImage(const ImageInfo& info, ImageId image_id);
+
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
@@ -146,6 +206,12 @@ public:
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth);
+
+    /// Grows whenever a sampler is deleted: a handle remembered outside (Rasterizer sampler
+    /// memo) is valid while it does not change. Lock free.
+    [[nodiscard]] u64 SamplersGeneration() const noexcept {
+        return samplers_generation.load(std::memory_order_acquire);
+    }
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -198,6 +264,21 @@ public:
             return it.value().clear_mask & (1u << slice);
         }
         return false;
+    }
+
+    /// Whether the slice of the metadata surface is cleared, and marks it used (one lookup
+    /// for IsMetaCleared then TouchMeta(false), per target and draw).
+    bool ConsumeMetaClear(VAddr address, u32 slice) {
+        if (address == 0) {
+            return false;
+        }
+        auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return false;
+        }
+        const bool cleared = it.value().clear_mask & (1u << slice);
+        it.value().clear_mask &= ~(1u << slice);
+        return cleared;
     }
 
     /// Clears all slices of the specified metadata surface.
@@ -285,6 +366,9 @@ private:
         }
     }
 
+    /// Whether an image is registered in the page_table pages of the range. Lock free.
+    bool HasImagesInRange(VAddr addr, size_t size) const;
+
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
@@ -353,6 +437,31 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
+    /// Images registered in each page_table page, changed under the lock and read without it by
+    /// invalidations, which mostly hit pages without images (guest write faults).
+    std::atomic<u64> generation{1};
+    std::atomic<u64> samplers_generation{1};
+    void BumpGeneration() noexcept {
+        generation.fetch_add(1, std::memory_order_release);
+    }
+    static constexpr u32 NumImageGens = 1 << 16;
+    std::unique_ptr<std::atomic<u32>[]> image_gens{std::make_unique<std::atomic<u32>[]>(NumImageGens)};
+    void BumpImageGeneration(ImageId image_id) noexcept {
+        if (image_id.index < NumImageGens) {
+            image_gens[image_id.index].fetch_add(1, std::memory_order_release);
+        } else {
+            BumpGeneration();
+        }
+    }
+    std::unique_ptr<std::atomic<u32>[]> page_image_counts{
+        std::make_unique<std::atomic<u32>[]>(NumImagePages)};
+    /// Registered images by guest start address, for exact address lookups.
+    tsl::robin_map<VAddr, boost::container::small_vector<ImageId, 2>> image_address_index;
+    struct LearnedExtent {
+        u32 pitch;
+        AmdGpu::CbDbExtent extent;
+    };
+    tsl::robin_map<VAddr, LearnedExtent> learned_extents; ///< See LearnTargetSize.
     std::mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;

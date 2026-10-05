@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -53,6 +54,12 @@ struct VideoOutPort {
     void WaitVoLabel(auto&& pred) {
         std::unique_lock lk{vo_mutex};
         vo_cv.wait(lk, pred);
+    }
+
+    /// Same as WaitVoLabel with a timeout, returns the final value of pred.
+    bool WaitVoLabelFor(auto&& pred, std::chrono::microseconds timeout) {
+        std::unique_lock lk{vo_mutex};
+        return vo_cv.wait_for(lk, timeout, pred);
     }
 
     void SignalVoLabel() {

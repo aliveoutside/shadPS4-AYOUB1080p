@@ -100,7 +100,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     state.depth_stencil_attachment.depth_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Recorder();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = color_view,
@@ -201,7 +201,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Recorder();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = src_view,

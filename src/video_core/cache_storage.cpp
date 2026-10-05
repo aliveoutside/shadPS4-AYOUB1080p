@@ -137,6 +137,30 @@ void DataBase::Close() {
     LOG_INFO(Render, "Cache dumped");
 }
 
+void DataBase::Reset() {
+    if (!IsOpened()) {
+        return;
+    }
+    if (EmulatorSettings.IsPipelineCacheArchived() && zip_ar.m_zip_mode == MZ_ZIP_MODE_READING) {
+        // Release the file handle of the old archive so it can be moved aside.
+        mz_zip_reader_end(&zip_ar);
+    }
+    Close();
+
+    // Keep a single copy of the previous cache next to the new one instead of deleting it.
+    std::error_code ec;
+    auto old_path = cache_path;
+    old_path += ".incompatible";
+    std::filesystem::remove_all(old_path, ec);
+    std::filesystem::rename(cache_path, old_path, ec);
+    if (ec) {
+        LOG_WARNING(Render, "Could not move the old cache aside ({}), deleting it", ec.message());
+        std::filesystem::remove_all(cache_path, ec);
+    }
+    LOG_INFO(Render, "Pipeline cache reset, the previous one was moved to {}", old_path.string());
+    Open();
+}
+
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {

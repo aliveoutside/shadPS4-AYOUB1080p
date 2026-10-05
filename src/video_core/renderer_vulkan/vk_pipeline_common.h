@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -59,9 +61,33 @@ public:
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    /// Binds on the given scheduler's command buffer (another queue, asc_queue); only for a
+    /// pipeline using push descriptors (descriptor sets are recycled with this pipeline's
+    /// scheduler).
+    void BindResources(Scheduler& on, DescriptorWrites& set_writes,
+                       const Shader::PushData& push_data) const;
+
+    /// Whether the descriptors are pushed (no descriptor set allocated per bind).
+    [[nodiscard]] bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
+
+    /// Returns true once the Vulkan pipeline object exists. A pipeline whose creation was
+    /// deferred is compiled by a worker thread and must not be bound before that.
+    [[nodiscard]] bool IsReady() const noexcept {
+        return ready.load(std::memory_order_acquire);
+    }
+
+    /// Creates the Vulkan pipeline object when the constructor deferred it. Called exactly once,
+    /// from any thread, while no other thread uses the pipeline.
+    virtual void Compile() = 0;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+
+    void MarkReady() noexcept {
+        ready.store(true, std::memory_order_release);
+    }
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -73,6 +99,7 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    std::atomic<bool> ready{false};
 };
 
 } // namespace Vulkan

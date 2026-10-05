@@ -42,6 +42,7 @@
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
 #include "core/memory.h"
+#include "core/perf_sampler.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/cache_storage.h"
@@ -487,6 +488,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
+    LOG_INFO(Config, "GPU readbacksWriteDiscard: {}", EmulatorSettings.IsReadbacksWriteDiscard());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
     LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
     LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
@@ -518,6 +520,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     LOG_INFO(Config, "Total RAM: {} GB", std::round(ram.total_Bytes() / pow(1024, 3)));
     LOG_INFO(Config, "Operating System: {}", os.name());
+    Core::PerfSampler::ApplyGameProfile(id);
+    Core::PerfSampler::Start();
+    // Tuning read once before the renderer starts (some settings only apply at startup).
+    Core::PerfSampler::PollTuning();
 
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
@@ -778,6 +784,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
 
     LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
+    Core::PerfSampler::Stop();
     Common::Log::Shutdown();
 
     auto& ipc = IPC::Instance();

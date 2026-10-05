@@ -950,6 +950,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/module.cpp
          src/core/module.h
          src/core/platform.h
+         src/core/perf_sampler.cpp
+         src/core/perf_sampler.h
          src/core/signals.cpp
          src/core/signals.h
          src/core/thread.cpp
@@ -1094,6 +1096,8 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
+               src/video_core/amdgpu/scout.cpp
+               src/video_core/amdgpu/scout.h
                src/video_core/amdgpu/pixel_format.cpp
                src/video_core/amdgpu/pixel_format.h
                src/video_core/amdgpu/pm4_cmds.h

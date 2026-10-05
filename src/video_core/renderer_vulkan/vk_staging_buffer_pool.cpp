@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <mutex>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -91,6 +92,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
 
 StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred,
                                                  bool unsynchronized) {
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(type)];
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
 
@@ -134,6 +136,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+    // Also called from the scheduler's priority thread (asynchronous image downloads).
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
@@ -175,6 +179,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
+    std::scoped_lock lk{large_mutex};
     std::erase_if(cache, [this](const LargeBuffer& entry) {
         return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
                scheduler.IsFree(entry.tick);
@@ -194,6 +199,7 @@ void StagingBufferPool::PublishStats() const {
         for (const Block& block : rings[i].blocks) {
             bytes += block.buffer->SizeBytes();
         }
+        std::scoped_lock lk{large_mutex};
         for (const LargeBuffer& entry : large_caches[i]) {
             bytes += entry.buffer->SizeBytes();
         }

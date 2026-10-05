@@ -47,11 +47,16 @@ public:
     ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
-    ~ComputePipeline();
+                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
+                    bool defer_compile = false);
+    ~ComputePipeline() override;
+
+    void Compile() override;
 
 private:
     ComputePipelineKey compute_key;
+    vk::ShaderModule module;
+    vk::PipelineCache vk_pipeline_cache;
 };
 
 } // namespace Vulkan

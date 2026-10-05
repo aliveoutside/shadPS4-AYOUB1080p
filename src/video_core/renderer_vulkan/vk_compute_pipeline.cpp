@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/perf_stats.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -13,23 +14,14 @@ namespace Vulkan {
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
-                                 const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
+                                 const Shader::Info& info_, vk::ShaderModule module_,
+                                 SerializationSupport& sdata, bool preloading /*=false*/,
+                                 bool defer_compile /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
-      compute_key{compute_key_} {
+      compute_key{compute_key_}, module{module_}, vk_pipeline_cache{pipeline_cache} {
     auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
-
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
-    };
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
-        .stage = vk::ShaderStageFlagBits::eCompute,
-        .module = module,
-        .pName = "main",
-    };
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
@@ -102,18 +94,41 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
+    // Everything that reads the guest state is done above, on the command processor thread.
+    // Creating the pipeline object only needs the module and the layout, so it can be deferred
+    // to a worker thread (it takes the driver up to a few hundred milliseconds).
+    if (!defer_compile) {
+        Compile();
+    }
+}
+
+ComputePipeline::~ComputePipeline() = default;
+
+void ComputePipeline::Compile() {
+    const u64 start_ns = Common::Perf::NowNs();
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+        .requiredSubgroupSize = 64,
+    };
+    const vk::PipelineShaderStageCreateInfo shader_ci = {
+        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .stage = vk::ShaderStageFlagBits::eCompute,
+        .module = module,
+        .pName = "main",
+    };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
+    const auto device = instance.GetDevice();
     auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+        device.createComputePipelineUnique(vk_pipeline_cache, compute_pipeline_ci);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
-    SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+    SetObjectName(device, *pipeline, "Compute Pipeline {}", GetDebugString());
+    Common::Perf::Add(Common::Perf::PipelineCreates);
+    Common::Perf::Add(Common::Perf::PipelineCreateNs, Common::Perf::NowNs() - start_ns);
+    MarkReady();
 }
-
-ComputePipeline::~ComputePipeline() = default;
 
 } // namespace Vulkan

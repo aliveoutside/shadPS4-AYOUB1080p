@@ -254,6 +254,21 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// Memory scanner: the mapped ranges of guest memory holding data (direct, flexible and
+    /// pooled memory), in address order.
+    struct MappedRange {
+        VAddr base;
+        u64 size;
+        VMAType type;
+        MemoryProt prot;
+        std::string name;
+    };
+    std::vector<MappedRange> GetDataRanges();
+
+    /// 64 bit hash of guest memory read through its backing like CopySparseMemory (no fault on
+    /// protected pages, unmapped parts hash as their size).
+    u64 HashSparseMemory(VAddr source, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

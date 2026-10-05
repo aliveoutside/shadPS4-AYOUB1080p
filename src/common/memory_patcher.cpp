@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <string_view>
 #include <codecvt>
 #include <fstream>
 #include <sstream>
@@ -161,6 +164,9 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 
                         std::string address = patchLineIt->attribute("Address").value();
                         std::string patchValue = patchLineIt->attribute("Value").value();
+                        std::string originalStr = patchLineIt->attribute("Original").value();
+                        std::string originalHashStr =
+                            patchLineIt->attribute("OriginalHash").value();
                         std::string maskOffsetStr = patchLineIt->attribute("Offset").value();
                         std::string targetStr = "";
                         std::string sizeStr = "";
@@ -209,14 +215,81 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
                             .littleEndian = littleEndian,
                             .patchMask = patchMask,
                             .maskOffset = maskOffsetValue,
+                            .originalStr = originalStr,
+                            .originalHashStr = originalHashStr,
                         };
-                        MemoryPatcher::PatchMemory(patch);
+                        if (!MemoryPatcher::PatchMemory(patch) &&
+                            (!originalStr.empty() || !originalHashStr.empty())) {
+                            // The lines of a patch depend on each other (code written first,
+                            // then the jumps to it): stop at the first line that does not match.
+                            LOG_ERROR(Loader, "Patch {}: the remaining lines are skipped",
+                                      currentPatchName);
+                            break;
+                        }
                     }
                 }
             }
         }
     } else {
         LOG_ERROR(Loader, "Could not parse patch XML: {}", result.description());
+    }
+}
+
+// Fixes built into this build for the games it is tuned for. They do not depend on the patch
+// files or on the launcher: each one is checked against the code of the game (FNV-1a 64 hash of
+// the bytes it replaces) and left out on another version of the game, or when a patch already
+// made the same change. SHADPS4_GAME_PROFILE=0 disables them, with the game profile.
+static void ApplyBuiltInFixes() {
+    const char* profile = std::getenv("SHADPS4_GAME_PROFILE");
+    if (profile != nullptr && std::string_view{profile} == "0") {
+        return;
+    }
+    struct BuiltInFix {
+        std::string_view serial;
+        std::string_view name;
+        std::string_view address; // as in the patch files (executable loaded at 0x400000)
+        std::string_view value;
+        std::string_view original_hash;
+    };
+    static constexpr std::array fixes{
+        // inFAMOUS Second Son, PS4 Pro mode: its checkerboard rendering shows a green screen,
+        // the game renders natively instead (sete r9b -> xor r9d, r9d).
+        BuiltInFix{"CUSA00004", "PS4 Pro mode without checkerboard (built in)", "0x005f0cbd",
+                   "4531C990", "5c04f08ca74bb842"},
+    };
+    for (const auto& fix : fixes) {
+        if (fix.serial != g_game_serial) {
+            continue;
+        }
+        const auto* current = reinterpret_cast<const unsigned char*>(
+            g_eboot_address + std::stoull(std::string{fix.address}, nullptr, 16) - 0x400000);
+        bool already = true;
+        for (size_t i = 0; i < fix.value.size() / 2; ++i) {
+            const auto byte = static_cast<unsigned char>(
+                std::stoul(std::string{fix.value.substr(i * 2, 2)}, nullptr, 16));
+            if (current[i] != byte) {
+                already = false;
+                break;
+            }
+        }
+        if (already) {
+            LOG_INFO(Loader, "Built-in fix {}: already made by a patch", fix.name);
+            continue;
+        }
+        PatchMemory({
+            .gameSerial = std::string{fix.serial},
+            .modNameStr = std::string{fix.name},
+            .offsetStr = std::string{fix.address},
+            .valueStr = std::string{fix.value},
+            .targetStr = "",
+            .sizeStr = "",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::None,
+            .maskOffset = 0,
+            .originalStr = "",
+            .originalHashStr = std::string{fix.original_hash},
+        });
     }
 }
 
@@ -273,6 +346,7 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+    ApplyBuiltInFixes();
 }
 
 void AddPatchToQueue(const patchInfo& patchToAdd) {
@@ -297,7 +371,7 @@ void ApplyPendingPatches() {
     pending_patches.clear();
 }
 
-void PatchMemory(const patchInfo& patch) {
+bool PatchMemory(const patchInfo& patch) {
     // Send a request to modify the process memory.
     void* cheatAddress = nullptr;
 
@@ -321,11 +395,11 @@ void PatchMemory(const patchInfo& patch) {
         constexpr int MAX_PATTERN_LENGTH = 256;
         if (jumpSize < 5) {
             LOG_ERROR(Loader, "Jump size must be at least 5 bytes");
-            return;
+            return false;
         }
         if (jumpSize > MAX_PATTERN_LENGTH) {
             LOG_ERROR(Loader, "Jump size must be no more than {} bytes.", MAX_PATTERN_LENGTH);
-            return;
+            return false;
         }
 
         // Find the base address using "Address"
@@ -333,7 +407,7 @@ void PatchMemory(const patchInfo& patch) {
         if (baseAddress == 0) {
             LOG_ERROR(Loader, "PatternScan failed for mask_jump32 with pattern: {}",
                       patch.offsetStr);
-            return;
+            return false;
         }
         uintptr_t patchAddress = baseAddress + patch.maskOffset;
 
@@ -345,7 +419,7 @@ void PatchMemory(const patchInfo& patch) {
         uintptr_t jump_target = PatternScan(patch.targetStr);
         if (jump_target == 0) {
             LOG_ERROR(Loader, "PatternScan failed to Target with pattern: {}", patch.targetStr);
-            return;
+            return false;
         }
 
         // Converts the Value attribute to a byte array (payload)
@@ -358,7 +432,7 @@ void PatchMemory(const patchInfo& patch) {
 
             if (endPtr != byteStr + 2) {
                 LOG_ERROR(Loader, "Invalid byte in Value: {}", patch.valueStr.substr(i, 2));
-                return;
+                return false;
             }
             payload.push_back(static_cast<u8>(byteVal));
         }
@@ -390,12 +464,12 @@ void PatchMemory(const patchInfo& patch) {
                  "Applied Patch mask_jump32: {}, PatchAddress: {:#x}, JumpTarget: {:#x}, "
                  "CodeCaveEnd: {:#x}, JumpSize: {}",
                  patch.modNameStr, patchAddress, jump_target, code_cave_end, jumpSize);
-        return;
+        return true;
     }
 
     if (cheatAddress == nullptr) {
         LOG_ERROR(Loader, "Failed to get address for patch {}", patch.modNameStr);
-        return;
+        return false;
     }
 
     std::vector<unsigned char> bytePatch;
@@ -411,10 +485,43 @@ void PatchMemory(const patchInfo& patch) {
         std::reverse(bytePatch.begin(), bytePatch.end());
     }
 
+    if (!patch.originalStr.empty()) {
+        std::vector<unsigned char> original;
+        for (size_t i = 0; i + 1 < patch.originalStr.length(); i += 2) {
+            original.push_back(static_cast<unsigned char>(
+                std::strtol(patch.originalStr.substr(i, 2).c_str(), nullptr, 16)));
+        }
+        if (std::memcmp(cheatAddress, original.data(), original.size()) != 0) {
+            LOG_ERROR(Loader,
+                      "Patch {} skipped: the bytes at {:#x} are not the expected ones, the patch "
+                      "is probably made for another version of the game",
+                      patch.modNameStr, reinterpret_cast<uintptr_t>(cheatAddress));
+            return false;
+        }
+    }
+
+    if (!patch.originalHashStr.empty()) {
+        // FNV-1a (64 bits) of the bytes the patch writes over: checks the version of the game
+        // without the patch file carrying the game's own bytes.
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto* current = static_cast<const unsigned char*>(cheatAddress);
+        for (size_t i = 0; i < bytePatch.size(); ++i) {
+            hash = (hash ^ current[i]) * 0x100000001b3ULL;
+        }
+        if (hash != std::strtoull(patch.originalHashStr.c_str(), nullptr, 16)) {
+            LOG_ERROR(Loader,
+                      "Patch {} skipped: the code at {:#x} is not the expected one, the patch is "
+                      "probably made for another version of the game",
+                      patch.modNameStr, reinterpret_cast<uintptr_t>(cheatAddress));
+            return false;
+        }
+    }
+
     std::memcpy(cheatAddress, bytePatch.data(), bytePatch.size());
 
     LOG_INFO(Loader, "Applied patch: {}, Offset: {:#x}, Value: {}", patch.modNameStr,
              (uintptr_t)cheatAddress, patch.valueStr);
+    return true;
 }
 
 static std::vector<int32_t> PatternToByte(const std::string& pattern) {

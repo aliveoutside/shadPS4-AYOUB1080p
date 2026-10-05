@@ -1,8 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <span>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/perf_stats.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -10,10 +25,291 @@
 
 namespace Vulkan {
 
+namespace {
+/// Tells the CPU this thread is spinning (cheaper for the other hyperthread of its core).
+inline void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+} // Anonymous namespace
+
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+namespace GpuCrashDiag {
+
+namespace {
+
+constexpr u64 RingSize = 1ULL << 16;
+std::array<Entry, RingSize> g_ring{};
+std::atomic<u64> g_next_seq{1};
+std::atomic<const Instance*> g_instance{};
+std::once_flag g_reported;
+
+const char* KindName(Kind kind) {
+    switch (kind) {
+    case Kind::Draw:
+        return "draw";
+    case Kind::DrawIndexed:
+        return "draw indexed";
+    case Kind::DrawIndirect:
+        return "draw indirect";
+    case Kind::DrawIndexedIndirect:
+        return "draw indexed indirect";
+    case Kind::Dispatch:
+        return "dispatch";
+    case Kind::DispatchIndirect:
+        return "dispatch indirect";
+    case Kind::Detile:
+        return "detile image";
+    case Kind::Tile:
+        return "tile image";
+    }
+    return "?";
+}
+
+void LogEntry(u64 seq, const char* tag) {
+    const Entry& e = g_ring[seq & (RingSize - 1)];
+    if (e.seq != seq) {
+        LOG_CRITICAL(Render_Vulkan, "  {} #{}: no longer recorded", tag, seq);
+        return;
+    }
+    switch (e.kind) {
+    case Kind::Draw:
+    case Kind::DrawIndexed:
+    case Kind::DrawIndirect:
+    case Kind::DrawIndexedIndirect:
+        LOG_CRITICAL(Render_Vulkan,
+                     "  {} #{} tick {}: {} vs {:#x} ps {:#x} count {} instances/stride {} "
+                     "area {}x{}x{} args {:#x}",
+                     tag, seq, e.tick, KindName(e.kind), e.hashes[0], e.hashes[1], e.count,
+                     e.instances, e.dims[0], e.dims[1], e.dims[2], e.address);
+        break;
+    case Kind::Dispatch:
+    case Kind::DispatchIndirect:
+        LOG_CRITICAL(Render_Vulkan, "  {} #{} tick {}: {} cs {:#x} groups {}x{}x{} args {:#x}", tag,
+                     seq, e.tick, KindName(e.kind), e.hashes[0], e.dims[0], e.dims[1], e.dims[2],
+                     e.address);
+        break;
+    case Kind::Detile:
+    case Kind::Tile:
+        LOG_CRITICAL(Render_Vulkan, "  {} #{} tick {}: {} {}x{}x{} at {:#x} ({} groups)", tag, seq,
+                     e.tick, KindName(e.kind), e.dims[0], e.dims[1], e.dims[2], e.address, e.count);
+        break;
+    }
+}
+
+void ReportCheckpoints(const Instance& instance) {
+    const auto& dld = VULKAN_HPP_DEFAULT_DISPATCHER;
+    if (!instance.HasDiagnosticCheckpoints() || !dld.vkGetQueueCheckpointDataNV) {
+        LOG_CRITICAL(Render_Vulkan, "GPU checkpoints: not supported");
+        return;
+    }
+    const u64 last_seq = g_next_seq.load(std::memory_order_relaxed) - 1;
+    if (last_seq == 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "GPU checkpoints: none recorded (set gpu_checkpoints = 1 in perf_tuning.ini)");
+        return;
+    }
+    const VkQueue queue = instance.GetGraphicsQueue();
+    u32 count = 0;
+    dld.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{
+                                                    .sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV,
+                                                });
+    dld.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+    data.resize(count);
+    LOG_CRITICAL(Render_Vulkan, "GPU checkpoints: {} reported, last recorded #{}", count, last_seq);
+    u64 lowest = last_seq;
+    u64 highest = 0;
+    for (const auto& checkpoint : data) {
+        const u64 seq = reinterpret_cast<u64>(checkpoint.pCheckpointMarker);
+        LOG_CRITICAL(Render_Vulkan, "GPU checkpoint at stage {}: #{}",
+                     vk::to_string(vk::PipelineStageFlags{
+                         static_cast<VkPipelineStageFlags>(checkpoint.stage)}),
+                     seq);
+        if (seq != 0) {
+            lowest = std::min(lowest, seq);
+            highest = std::max(highest, seq);
+        }
+    }
+    if (highest == 0) {
+        return;
+    }
+    // The work between the last completed and the last started checkpoints, with some context.
+    const u64 first = lowest > 4 ? lowest - 4 : 1;
+    const u64 last = std::min(highest + 4, last_seq);
+    for (u64 seq = first; seq <= last && seq - first < 64; ++seq) {
+        const char* tag = seq == highest ? ">>" : (seq == lowest ? "--" : "  ");
+        LogEntry(seq, tag);
+    }
+}
+
+void ReportDeviceFault(const Instance& instance) {
+    const auto& dld = VULKAN_HPP_DEFAULT_DISPATCHER;
+    if (!instance.HasDeviceFault() || !dld.vkGetDeviceFaultInfoEXT) {
+        LOG_CRITICAL(Render_Vulkan, "GPU fault info: not supported");
+        return;
+    }
+    const VkDevice device = instance.GetDevice();
+    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult result = dld.vkGetDeviceFaultInfoEXT(device, &counts, nullptr);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        LOG_CRITICAL(Render_Vulkan, "GPU fault info: query failed ({})", int(result));
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+        .pAddressInfos = addresses.empty() ? nullptr : addresses.data(),
+        .pVendorInfos = vendors.empty() ? nullptr : vendors.data(),
+    };
+    result = dld.vkGetDeviceFaultInfoEXT(device, &counts, &info);
+    LOG_CRITICAL(Render_Vulkan, "GPU fault info ({}): {} | {} addresses, {} vendor records",
+                 int(result), info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    for (u32 i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
+        const auto& a = addresses[i];
+        LOG_CRITICAL(Render_Vulkan, "  fault address type {} at {:#x} (precision {:#x})",
+                     int(a.addressType), a.reportedAddress, a.addressPrecision);
+    }
+    for (u32 i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
+        const auto& v = vendors[i];
+        LOG_CRITICAL(Render_Vulkan, "  vendor fault {}: code {:#x} data {:#x}", v.description,
+                     v.vendorFaultCode, v.vendorFaultData);
+    }
+}
+
+} // Anonymous namespace
+
+bool Enabled() {
+    const Instance* instance = g_instance.load(std::memory_order_relaxed);
+    return instance && instance->HasDiagnosticCheckpoints() &&
+           Common::Perf::GetTuning().gpu_checkpoints.load(std::memory_order_relaxed);
+}
+
+void Mark(const CommandRecorder& cmdbuf, u64 tick, const Entry& entry) {
+    const u64 seq = g_next_seq.fetch_add(1, std::memory_order_relaxed);
+    Entry& slot = g_ring[seq & (RingSize - 1)];
+    slot = entry;
+    slot.seq = seq;
+    slot.tick = tick;
+    cmdbuf.Record([seq](vk::CommandBuffer c) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV(static_cast<VkCommandBuffer>(c),
+                                                           reinterpret_cast<const void*>(seq));
+    });
+}
+
+void ReportDeviceLost(const Instance& instance, const char* where) {
+    std::call_once(g_reported, [&] {
+        LOG_CRITICAL(Render_Vulkan, "GPU crash diagnostics: device lost during {}", where);
+        ReportCheckpoints(instance);
+        ReportDeviceFault(instance);
+    });
+}
+
+} // namespace GpuCrashDiag
+
+/// gpu_profile (perf_tuning.ini): GPU timestamps around the submissions of the command processor
+/// and its compute dispatches, read once the GPU has finished them. Command processor thread.
+struct Scheduler::GpuProfile {
+    static constexpr u64 NumQueries = 1u << 16;
+    static constexpr u64 NoQuery = ~u64{0};
+    static constexpr u64 ReportIntervalNs = 5'000'000'000ULL;
+
+    struct Dispatch {
+        u64 begin; ///< Query numbers (monotonic, the ring index is the number modulo NumQueries).
+        u64 end;
+        u64 hash;
+    };
+    struct Session {
+        u64 tick{};
+        u64 first{}; ///< Number of the first query of the session (they are consecutive).
+        u64 count{};
+        u64 begin{NoQuery};
+        u64 end{NoQuery};
+        u64 in_flight{};
+        bool readback{};
+        bool active{};
+        std::vector<Dispatch> dispatches;
+    };
+
+    explicit GpuProfile(const Instance& instance) : device{instance.GetDevice()} {
+        const vk::PhysicalDevice physical_device = instance.GetPhysicalDevice();
+        period_ns = physical_device.getProperties().limits.timestampPeriod;
+        const auto families = physical_device.getQueueFamilyProperties();
+        const u32 family = instance.GetGraphicsQueueFamilyIndex();
+        const u32 valid_bits = family < families.size() ? families[family].timestampValidBits : 0;
+        valid_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+        if (valid_bits == 0 || !instance.IsHostQueryResetSupported()) {
+            LOG_WARNING(Render_Vulkan,
+                        "gpu_profile: no GPU timestamps (valid bits {}, host query reset {})",
+                        valid_bits, instance.IsHostQueryResetSupported());
+            return;
+        }
+        auto [result, created] = device.createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = static_cast<u32>(NumQueries),
+        });
+        if (result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "gpu_profile: query pool creation failed: {}",
+                        vk::to_string(result));
+            return;
+        }
+        pool = created;
+        device.resetQueryPool(pool, 0, static_cast<u32>(NumQueries));
+        usable = true;
+        report_start_ns = Common::Perf::NowNs();
+        LOG_INFO(Render_Vulkan, "gpu_profile: GPU timestamps of {} ns, {} valid bits", period_ns,
+                 valid_bits);
+    }
+
+    ~GpuProfile() {
+        if (pool) {
+            // Submissions using the queries may still run.
+            std::ignore = device.waitIdle();
+            device.destroyQueryPool(pool);
+        }
+    }
+
+    /// The number of a free query of the ring, false when the ring is full (not read yet).
+    bool Allocate(u64& number) {
+        if (!usable || allocated - released >= NumQueries) {
+            return false;
+        }
+        number = allocated++;
+        ++current.count;
+        return true;
+    }
+
+    u32 Index(u64 number) const {
+        return static_cast<u32>(number % NumQueries);
+    }
+
+    vk::Device device;
+    vk::QueryPool pool{};
+    double period_ns{1.0};
+    u64 valid_mask{};
+    bool usable{};
+    u64 allocated{};
+    u64 released{};
+    Session current;
+    std::deque<Session> pending;
+    u64 last_end{}; ///< Latest end timestamp read (busy time without overlaps).
+    u64 open_dispatch{NoQuery};
+    u64 open_hash{};
+    std::unordered_map<u64, std::pair<u64, u64>> shader_ns; ///< hash: GPU ns, dispatches.
+    u64 report_start_ns{};
+    std::vector<u64> results;
+};
+
+Scheduler::Scheduler(const Instance& instance, vk::Queue queue_, const char* name_)
+    : instance{instance}, queue{queue_ ? queue_ : instance.GetGraphicsQueue()}, name{name_},
+      work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    GpuCrashDiag::g_instance.store(&instance, std::memory_order_relaxed);
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -23,9 +319,150 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 Scheduler::~Scheduler() {
+    if (recorder_thread.joinable()) {
+        SyncRecorder();
+        recorder_thread.request_stop();
+        recorder_thread.join();
+    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+}
+
+void Scheduler::AllowThreadedRecording() {
+    if (threading_allowed) {
+        return;
+    }
+    threading_allowed = true;
+    recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
+}
+
+vk::CommandBuffer Scheduler::CommandBuffer() {
+    // The caller records in the command buffer without going through CommandRecorder: what it
+    // binds is not known here.
+    session_used = true;
+    dynamic_state.binds.Forget();
+    if (!direct_cmdbuf) {
+        // The session is recorded by the recording thread: once it has recorded what it was
+        // given, it is idle and the command buffer is recorded here until the submission.
+        const u64 sync_start = Common::Perf::NowNs();
+        SyncRecorder();
+        Common::Perf::Add(Common::Perf::RecorderSyncs);
+        Common::Perf::Add(Common::Perf::RecorderSyncNs, Common::Perf::NowNs() - sync_start);
+        direct_cmdbuf = RecorderCommandBuffer();
+    }
+    return direct_cmdbuf;
+}
+
+CommandStream& Scheduler::Stream() {
+    session_used = true;
+    // Batches of commands go to the recording thread while the next ones are recorded.
+    static constexpr size_t DispatchCommands = 256;
+    if (stream->NumCommands() >= DispatchCommands) {
+        DispatchStream();
+    }
+    return *stream;
+}
+
+void Scheduler::DispatchStream() {
+    if (!stream || stream->Empty()) {
+        return;
+    }
+    Common::Perf::Add(Common::Perf::RecorderJobs);
+    Common::Perf::Add(Common::Perf::RecorderCommands, stream->NumCommands());
+    std::unique_ptr<CommandStream> next;
+    bool wake;
+    {
+        std::scoped_lock lk{recorder_mutex};
+        recorder_jobs.push_back(RecorderJob{.stream = std::move(stream)});
+        recorder_queued.fetch_add(1, std::memory_order_release);
+        if (!free_streams.empty()) {
+            next = std::move(free_streams.back());
+            free_streams.pop_back();
+        }
+        wake = recorder_waiting;
+    }
+    if (wake) {
+        // Only a sleeping recording thread needs to be woken up (a system call).
+        Common::Perf::Add(Common::Perf::RecorderWakes);
+        recorder_cv.notify_one();
+    }
+    stream = next ? std::move(next) : std::make_unique<CommandStream>();
+}
+
+void Scheduler::SyncRecorder() {
+    if (!recorder_thread.joinable()) {
+        return;
+    }
+    DispatchStream();
+    std::unique_lock lk{recorder_mutex};
+    recorder_idle_cv.wait(lk, [this] { return recorder_jobs.empty() && !recorder_busy; });
+}
+
+vk::CommandBuffer Scheduler::RecorderCommandBuffer() {
+    if (!recorder_cmdbuf) {
+        recorder_cmdbuf = command_pool.Commit();
+        Check(recorder_cmdbuf.begin(vk::CommandBufferBeginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        }));
+    }
+    return recorder_cmdbuf;
+}
+
+void Scheduler::RecorderThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuCommandRecorder");
+    while (true) {
+        // Optionally wait a little for the next commands before sleeping: the command processor
+        // then rarely has to wake this thread up.
+        const u32 spin_us =
+            Common::Perf::GetTuning().recorder_spin_us.load(std::memory_order_relaxed);
+        if (spin_us != 0 && recorder_queued.load(std::memory_order_acquire) == 0) {
+            const u64 deadline = Common::Perf::NowNs() + u64{spin_us} * 1000;
+            while (recorder_queued.load(std::memory_order_acquire) == 0 &&
+                   !stoken.stop_requested() && Common::Perf::NowNs() < deadline) {
+                for (u32 i = 0; i < 16; ++i) {
+                    CpuRelax();
+                }
+            }
+        }
+        RecorderJob job;
+        {
+            std::unique_lock lk{recorder_mutex};
+            recorder_waiting = true;
+            recorder_cv.wait(lk, stoken, [this] { return !recorder_jobs.empty(); });
+            recorder_waiting = false;
+            if (recorder_jobs.empty()) {
+                return;
+            }
+            job = std::move(recorder_jobs.front());
+            recorder_jobs.pop_front();
+            recorder_queued.fetch_sub(1, std::memory_order_relaxed);
+            recorder_busy = true;
+        }
+        const u64 busy_start = Common::Perf::NowNs();
+        if (job.stream && !job.stream->Empty()) {
+            job.stream->Execute(RecorderCommandBuffer());
+        }
+        if (job.submit) {
+            const vk::CommandBuffer cmdbuf = RecorderCommandBuffer();
+            Check(cmdbuf.end());
+            recorder_cmdbuf = vk::CommandBuffer{};
+            std::scoped_lock lk{submit_mutex};
+            SubmitToQueue(std::span{&cmdbuf, 1}, job.info);
+        }
+        Common::Perf::Add(Common::Perf::RecorderBusyNs, Common::Perf::NowNs() - busy_start);
+        {
+            std::scoped_lock lk{recorder_mutex};
+            if (job.stream) {
+                job.stream->Reset();
+                free_streams.push_back(std::move(job.stream));
+            }
+            recorder_busy = false;
+            if (recorder_jobs.empty()) {
+                recorder_idle_cv.notify_all();
+            }
+        }
+    }
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
@@ -80,15 +517,23 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    const CommandRecorder cmdbuf = Recorder();
+    cmdbuf.beginRendering(rendering_info);
+    if (rendering_observer) {
+        rendering_observer->OnBeginRendering(cmdbuf);
+    }
 }
 
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    const CommandRecorder cmdbuf = Recorder();
+    if (rendering_observer) {
+        rendering_observer->OnEndRendering(cmdbuf);
+    }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    cmdbuf.endRendering();
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -128,31 +573,64 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const u64 wait_start = Common::Perf::NowNs();
     work_semaphore.Wait(tick);
+    const u64 wait_ns = Common::Perf::NowNs() - wait_start;
+    // Only count waits where the CPU actually blocked on the GPU.
+    if (wait_ns > 50'000) {
+        Common::Perf::Add(Common::Perf::GpuWaits);
+        Common::Perf::Add(Common::Perf::GpuWaitNs, wait_ns);
+    }
 }
 
 void Scheduler::PopPendingOperations() {
+    // Called before every draw: the lock and the semaphore query (a driver call) only when
+    // there is something to pop.
+    if (num_pending_ops.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::unique_lock lk(pending_ops_mutex);
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
+        num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
 }
 
 void Scheduler::BeginSession() {
     EndSession();
 
-    auto& session = sessions.emplace_back();
+    // Threaded recording (perf_tuning.ini), decided per session.
+    stream_session = threading_allowed &&
+                     Common::Perf::GetTuning().threaded_recording.load(std::memory_order_relaxed);
+    if (stream_session) {
+        // The recording thread allocates and records the command buffer of the session.
+        recorder_used = true;
+        direct_cmdbuf = vk::CommandBuffer{};
+        if (!stream) {
+            stream = std::make_unique<CommandStream>();
+        }
+        sessions.emplace_back();
+    } else {
+        if (std::exchange(recorder_used, false)) {
+            // The recording thread may still use the command pool for earlier sessions.
+            SyncRecorder();
+        }
+        auto& session = sessions.emplace_back();
 
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    session.primary = command_pool.Commit();
-    Check(session.primary.begin(begin_info));
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        session.primary = command_pool.Commit();
+        Check(session.primary.begin(begin_info));
+        direct_cmdbuf = session.primary;
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    ProfileSessionBegin();
+    session_used = false;
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -179,10 +657,109 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
-    Check(session.primary.end());
+    ProfileSessionEnd();
+    if (session.primary) {
+        Check(session.primary.end());
+    }
+}
+
+void Scheduler::AddCrossWait(vk::Semaphore semaphore, u64 tick) {
+    for (auto& wait : cross_waits) {
+        if (wait.semaphore == semaphore) {
+            wait.tick = std::max(wait.tick, tick);
+            return;
+        }
+    }
+    ASSERT_MSG(cross_waits.size() < cross_waits.capacity(), "Too many cross queue waits");
+    cross_waits.push_back(CrossWait{.semaphore = semaphore, .tick = tick});
+}
+
+u64 Scheduler::CrossWaitTick(vk::Semaphore semaphore) const noexcept {
+    for (const auto& wait : cross_waits) {
+        if (wait.semaphore == semaphore) {
+            return wait.tick;
+        }
+    }
+    return 0;
+}
+
+void Scheduler::TakeCrossWaits(SubmitInfo& info) {
+    for (const auto& wait : cross_waits) {
+        info.AddWait(wait.semaphore, wait.tick);
+    }
+    cross_waits.clear();
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (submitted_tick.load(std::memory_order_acquire) >= tick) {
+        return;
+    }
+    if (tick >= work_semaphore.CurrentTick()) {
+        // Not flushed yet: the caller flushes first.
+        Flush();
+    }
+    std::unique_lock lk{submitted_mutex};
+    submitted_cv.wait(lk, [&] { return submitted_tick.load(std::memory_order_acquire) >= tick; });
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    // Work of other threads the commands of the session read: done before they are submitted.
+    info.upload_dependency = std::max(
+        info.upload_dependency, submit_dependency.exchange(0, std::memory_order_acq_rel));
+    // Work of other queues the commands of the session depend on.
+    TakeCrossWaits(info);
+    if (stream_session) {
+        // Threaded recording: the recording thread submits the session after recording it.
+        const u64 signal_value = work_semaphore.NextTick();
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (on_submit) {
+                on_submit(info);
+            }
+        }
+        EndSession();
+        ProfileSessionSubmitted(signal_value);
+        sessions.clear();
+        info.AddSignal(work_semaphore.Handle(), signal_value);
+        if (direct_cmdbuf) {
+            // CommandBuffer() made the end of the session direct: the recording thread is idle.
+            Check(direct_cmdbuf.end());
+            recorder_cmdbuf = vk::CommandBuffer{};
+            std::scoped_lock lk{submit_mutex};
+            SubmitToQueue(std::span{&direct_cmdbuf, 1}, info);
+        } else {
+            std::unique_ptr<CommandStream> next;
+            bool wake;
+            {
+                std::scoped_lock lk{recorder_mutex};
+                if (stream && !stream->Empty()) {
+                    Common::Perf::Add(Common::Perf::RecorderJobs);
+                    Common::Perf::Add(Common::Perf::RecorderCommands, stream->NumCommands());
+                }
+                recorder_jobs.push_back(RecorderJob{
+                    .stream = std::move(stream),
+                    .submit = true,
+                    .info = info,
+                });
+                recorder_queued.fetch_add(1, std::memory_order_release);
+                if (!free_streams.empty()) {
+                    next = std::move(free_streams.back());
+                    free_streams.pop_back();
+                }
+                wake = recorder_waiting;
+            }
+            if (wake) {
+                Common::Perf::Add(Common::Perf::RecorderWakes);
+                recorder_cv.notify_one();
+            }
+            stream = next ? std::move(next) : std::make_unique<CommandStream>();
+        }
+        direct_cmdbuf = vk::CommandBuffer{};
+        BeginSession();
+        PopPendingOperations();
+        return;
+    }
+
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -199,6 +776,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     EndSession();
+    ProfileSessionSubmitted(signal_value);
 
     std::vector<vk::CommandBuffer> cmd_buffers;
     cmd_buffers.reserve(sessions.size() * 2);
@@ -214,10 +792,22 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
+    SubmitToQueue(cmd_buffers, info);
+
+    BeginSession();
+
+    // Apply pending operations
+    PopPendingOperations();
+}
+
+void Scheduler::SubmitToQueue(std::span<const vk::CommandBuffer> cmd_buffers, SubmitInfo& info) {
+    if (info.upload_dependency != 0 && submit_dependency_wait) {
+        // The GPU reads what the upload worker writes: wait until it is written.
+        const u64 wait_start = Common::Perf::NowNs();
+        submit_dependency_wait(info.upload_dependency);
+        Common::Perf::Add(Common::Perf::AsyncUploadWaitNs, Common::Perf::NowNs() - wait_start);
+        info.upload_dependency = 0;
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -230,22 +820,226 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pNext = &timeline_si,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = info.wait_stages.data(),
         .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
         .pCommandBuffers = cmd_buffers.data(),
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (queue == instance.GetGraphicsQueue()) {
+        ImGui::Core::TextureManager::Submit();
+    }
+    auto submit_result = queue.submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        GpuCrashDiag::ReportDeviceLost(instance, "submit");
+    }
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit ({})",
+               name);
+    // The tick these command buffers signal is now submitted (under submit_mutex: in order).
+    for (u32 i = 0; i < info.num_signal_semas; ++i) {
+        if (info.signal_semas[i] == work_semaphore.Handle()) {
+            const u64 tick = info.signal_ticks[i];
+            if (tick > submitted_tick.load(std::memory_order_relaxed)) {
+                std::scoped_lock lk{submitted_mutex};
+                submitted_tick.store(tick, std::memory_order_release);
+                submitted_cv.notify_all();
+            }
+        }
+    }
 
     work_semaphore.Refresh();
-    BeginSession();
+}
 
-    // Apply pending operations
-    PopPendingOperations();
+void Scheduler::ProfileSessionBegin() {
+    // Only the command processor's scheduler (the one allowed to record on a thread).
+    if (!threading_allowed) {
+        return;
+    }
+    if (Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) == 0) {
+        if (profile) {
+            profile->current = {};
+        }
+        return;
+    }
+    if (!profile) {
+        profile = std::make_unique<GpuProfile>(instance);
+    }
+    GpuProfile& prof = *profile;
+    prof.current = {};
+    prof.current.first = prof.allocated;
+    prof.open_dispatch = GpuProfile::NoQuery;
+    u64 number;
+    if (!prof.Allocate(number)) {
+        return;
+    }
+    prof.current.begin = number;
+    prof.current.active = true;
+    Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
+        c.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, pool, index);
+    });
+}
+
+void Scheduler::ProfileSessionEnd() {
+    if (!profile || !profile->current.active) {
+        return;
+    }
+    GpuProfile& prof = *profile;
+    u64 number;
+    if (!prof.Allocate(number)) {
+        return;
+    }
+    prof.current.end = number;
+    Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
+        c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
+    });
+}
+
+void Scheduler::ProfileSessionSubmitted(u64 tick) {
+    const bool readback = std::exchange(session_has_readback, false);
+    if (!profile || !profile->current.active) {
+        return;
+    }
+    GpuProfile& prof = *profile;
+    prof.current.tick = tick;
+    prof.current.readback = readback;
+    // Submissions before this one the GPU has not finished yet.
+    work_semaphore.Refresh();
+    const u64 done = work_semaphore.KnownGpuTick();
+    prof.current.in_flight = tick > done + 1 ? tick - done - 1 : 0;
+    prof.pending.push_back(std::move(prof.current));
+    prof.current = {};
+}
+
+void Scheduler::ProfileDispatchBegin(u64 shader_hash) {
+    if (!profile || !profile->current.active ||
+        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) < 2) {
+        return;
+    }
+    GpuProfile& prof = *profile;
+    u64 number;
+    if (!prof.Allocate(number)) {
+        return;
+    }
+    prof.open_dispatch = number;
+    prof.open_hash = shader_hash;
+    // Written once the work before the dispatch is done.
+    Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
+        c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
+    });
+}
+
+void Scheduler::ProfileDispatchEnd() {
+    if (!profile || profile->open_dispatch == GpuProfile::NoQuery) {
+        return;
+    }
+    GpuProfile& prof = *profile;
+    const u64 begin = std::exchange(prof.open_dispatch, GpuProfile::NoQuery);
+    u64 number;
+    if (!prof.Allocate(number)) {
+        return;
+    }
+    prof.current.dispatches.push_back(GpuProfile::Dispatch{
+        .begin = begin,
+        .end = number,
+        .hash = prof.open_hash,
+    });
+    Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
+        c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
+    });
+}
+
+void Scheduler::CollectProfile() {
+    if (!profile || profile->pending.empty()) {
+        return;
+    }
+    GpuProfile& prof = *profile;
+    const vk::Device device = prof.device;
+    work_semaphore.Refresh();
+    while (!prof.pending.empty() && work_semaphore.IsFree(prof.pending.front().tick)) {
+        const GpuProfile::Session& session = prof.pending.front();
+        prof.results.assign(session.count, 0);
+        bool valid = session.count != 0;
+        for (u64 read = 0; read < session.count;) {
+            const u32 index = prof.Index(session.first + read);
+            const u32 count = static_cast<u32>(
+                std::min<u64>(session.count - read, GpuProfile::NumQueries - index));
+            const vk::Result result = device.getQueryPoolResults(
+                prof.pool, index, count, count * sizeof(u64), prof.results.data() + read,
+                sizeof(u64), vk::QueryResultFlagBits::e64);
+            valid &= result == vk::Result::eSuccess;
+            // Free for new timestamps (the GPU is done with them).
+            device.resetQueryPool(prof.pool, index, count);
+            read += count;
+        }
+        prof.released += session.count;
+        const auto stamp = [&](u64 number) {
+            return prof.results[number - session.first] & prof.valid_mask;
+        };
+        const auto to_ns = [&](u64 ticks) {
+            return static_cast<u64>(static_cast<double>(ticks) * prof.period_ns);
+        };
+        if (valid && session.begin != GpuProfile::NoQuery && session.end != GpuProfile::NoQuery) {
+            const u64 start = stamp(session.begin);
+            const u64 end = stamp(session.end);
+            if (end >= start) {
+                const u64 busy_start = std::max(start, prof.last_end);
+                if (end > busy_start) {
+                    Common::Perf::Add(Common::Perf::GpuProfileBusyNs, to_ns(end - busy_start));
+                }
+                prof.last_end = std::max(prof.last_end, end);
+                const u64 ns = to_ns(end - start);
+                Common::Perf::Add(Common::Perf::GpuProfileSessions);
+                Common::Perf::Add(Common::Perf::GpuProfileSessionNs, ns);
+                Common::Perf::Add(Common::Perf::GpuProfileInFlight, session.in_flight);
+                if (session.readback) {
+                    Common::Perf::Add(Common::Perf::GpuProfileReadbackSessions);
+                    Common::Perf::Add(Common::Perf::GpuProfileReadbackNs, ns);
+                }
+            }
+            for (const auto& dispatch : session.dispatches) {
+                const u64 begin = stamp(dispatch.begin);
+                const u64 finish = stamp(dispatch.end);
+                if (finish < begin) {
+                    continue;
+                }
+                const u64 ns = to_ns(finish - begin);
+                auto& [shader_ns, shader_count] = prof.shader_ns[dispatch.hash];
+                shader_ns += ns;
+                ++shader_count;
+                Common::Perf::Add(Common::Perf::GpuProfileComputeNs, ns);
+                Common::Perf::Add(Common::Perf::GpuProfileDispatches);
+            }
+        }
+        prof.pending.pop_front();
+    }
+    const u64 now = Common::Perf::NowNs();
+    if (now - prof.report_start_ns < GpuProfile::ReportIntervalNs) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - prof.report_start_ns) / 1e9;
+    prof.report_start_ns = now;
+    if (prof.shader_ns.empty()) {
+        return;
+    }
+    std::vector<std::pair<u64, std::pair<u64, u64>>> sorted(prof.shader_ns.begin(),
+                                                            prof.shader_ns.end());
+    prof.shader_ns.clear();
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    u64 total_ns = 0;
+    for (const auto& entry : sorted) {
+        total_ns += entry.second.first;
+    }
+    LOG_INFO(Render_Vulkan, "Perf GPU compute: {:.1f} ms/s in {} shaders", total_ns / 1e6 / seconds,
+             sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
+        const auto& [hash, stats] = sorted[i];
+        LOG_INFO(Render_Vulkan,
+                 "Perf GPU compute shader {:016x}: {:.2f} ms/s, {:.0f} dispatches/s, {:.1f} us avg",
+                 hash, stats.first / 1e6 / seconds, stats.second / seconds,
+                 stats.second ? stats.first / 1e3 / static_cast<double>(stats.second) : 0.0);
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
@@ -274,7 +1068,186 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+namespace {
+bool SkipRedundantBinds() noexcept {
+    return Common::Perf::GetTuning().skip_redundant_binds.load(std::memory_order_relaxed);
+}
+} // Anonymous namespace
+
+bool DynamicState::BindCache::SkipPipeline(vk::PipelineBindPoint bind_point,
+                                           vk::Pipeline pipeline) noexcept {
+    u32 index;
+    if (bind_point == vk::PipelineBindPoint::eGraphics) {
+        index = 0;
+    } else if (bind_point == vk::PipelineBindPoint::eCompute) {
+        index = 1;
+    } else {
+        return false;
+    }
+    Common::Perf::Add(Common::Perf::PipelineBinds);
+    if (pipeline && pipelines[index] == pipeline) {
+        if (SkipRedundantBinds()) {
+            Common::Perf::Add(Common::Perf::PipelineBindsSkipped);
+            return true;
+        }
+        return false;
+    }
+    pipelines[index] = pipeline;
+    if (index == 0) {
+        // Another graphics pipeline: the vertex input is only left out under the same pipeline,
+        // which leaves no doubt about the state the command buffer keeps for it.
+        vertex_input_known = false;
+    }
+    return false;
+}
+
+bool DynamicState::BindCache::SkipPush(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
+                                       u32 offset, u32 size, const void* values) noexcept {
+    const u32 index = (stages & vk::ShaderStageFlagBits::eCompute) ? 1 : 0;
+    Push& push = pushes[index];
+    Common::Perf::Add(Common::Perf::ConstantPushes);
+    if (size == 0 || size > MaxPushBytes) {
+        push.size = 0;
+        return false;
+    }
+    if (push.size == size && push.layout == layout && push.stages == stages &&
+        push.offset == offset && std::memcmp(push.data.data(), values, size) == 0) {
+        if (SkipRedundantBinds()) {
+            Common::Perf::Add(Common::Perf::ConstantPushesSkipped);
+            return true;
+        }
+        return false;
+    }
+    push.layout = layout;
+    push.stages = stages;
+    push.offset = offset;
+    push.size = size;
+    std::memcpy(push.data.data(), values, size);
+    return false;
+}
+
+bool DynamicState::BindCache::SkipDescriptors(vk::PipelineBindPoint bind_point,
+                                              vk::PipelineLayout layout, u32 set,
+                                              std::span<const vk::WriteDescriptorSet> writes) noexcept {
+    u32 index;
+    if (bind_point == vk::PipelineBindPoint::eGraphics) {
+        index = 0;
+    } else if (bind_point == vk::PipelineBindPoint::eCompute) {
+        index = 1;
+    } else {
+        return false;
+    }
+    Descriptors& cache = descriptors[index];
+    Common::Perf::Add(Common::Perf::DescriptorPushes);
+    // The infos of a write as compared and kept: what the descriptor points to.
+    const auto info_at = [](const vk::WriteDescriptorSet& write, u32 i) -> Descriptors::Info {
+        switch (write.descriptorType) {
+        case vk::DescriptorType::eSampler:
+        case vk::DescriptorType::eCombinedImageSampler:
+        case vk::DescriptorType::eSampledImage:
+        case vk::DescriptorType::eStorageImage:
+        case vk::DescriptorType::eInputAttachment: {
+            const auto& info = write.pImageInfo[i];
+            return {reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler)),
+                    reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)),
+                    static_cast<u64>(info.imageLayout)};
+        }
+        case vk::DescriptorType::eUniformTexelBuffer:
+        case vk::DescriptorType::eStorageTexelBuffer:
+            return {reinterpret_cast<u64>(static_cast<VkBufferView>(write.pTexelBufferView[i])), 0,
+                    0};
+        default: {
+            const auto& info = write.pBufferInfo[i];
+            return {reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)), info.offset,
+                    info.range};
+        }
+        }
+    };
+    // Only plain writes of set 0 are kept (no extension structures, bounded sizes).
+    bool cacheable = set == 0 && writes.size() <= Descriptors::MaxWrites;
+    u32 total_infos = 0;
+    for (const auto& write : writes) {
+        if (write.pNext != nullptr) {
+            cacheable = false;
+            break;
+        }
+        total_infos += write.descriptorCount;
+    }
+    if (!cacheable || total_infos > Descriptors::MaxInfos) {
+        // Another set pushed with an incompatible layout can disturb set 0 too.
+        cache.num_writes = ~0U;
+        return false;
+    }
+    bool same = cache.num_writes == writes.size() && cache.layout == layout &&
+                cache.num_infos == total_infos;
+    if (same) {
+        u32 info_index = 0;
+        for (u32 w = 0; w < writes.size() && same; ++w) {
+            const auto& write = writes[w];
+            const auto& kept = cache.writes[w];
+            if (kept.binding != write.dstBinding || kept.array_element != write.dstArrayElement ||
+                kept.count != write.descriptorCount || kept.type != write.descriptorType) {
+                same = false;
+                break;
+            }
+            for (u32 i = 0; i < write.descriptorCount; ++i) {
+                if (!(cache.infos[info_index++] == info_at(write, i))) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (same) {
+        if (SkipRedundantBinds()) {
+            Common::Perf::Add(Common::Perf::DescriptorPushesSkipped);
+            return true;
+        }
+        return false;
+    }
+    cache.layout = layout;
+    cache.num_writes = static_cast<u32>(writes.size());
+    cache.num_infos = total_infos;
+    u32 info_index = 0;
+    for (u32 w = 0; w < writes.size(); ++w) {
+        const auto& write = writes[w];
+        cache.writes[w] = {write.dstBinding, write.dstArrayElement, write.descriptorCount,
+                           write.descriptorType};
+        for (u32 i = 0; i < write.descriptorCount; ++i) {
+            cache.infos[info_index++] = info_at(write, i);
+        }
+    }
+    return false;
+}
+
+bool DynamicState::BindCache::SkipVertexInput(
+    std::span<const vk::VertexInputBindingDescription2EXT> bindings,
+    std::span<const vk::VertexInputAttributeDescription2EXT> attributes) noexcept {
+    Common::Perf::Add(Common::Perf::VertexInputSets);
+    if (bindings.size() > MaxVertexInputs || attributes.size() > MaxVertexInputs) {
+        vertex_input_known = false;
+        return false;
+    }
+    // Compared member by member (operator==): the padding of the structures is not compared.
+    if (vertex_input_known && num_vertex_bindings == bindings.size() &&
+        num_vertex_attributes == attributes.size() &&
+        std::equal(bindings.begin(), bindings.end(), vertex_bindings.begin()) &&
+        std::equal(attributes.begin(), attributes.end(), vertex_attributes.begin())) {
+        if (SkipRedundantBinds()) {
+            Common::Perf::Add(Common::Perf::VertexInputSetsSkipped);
+            return true;
+        }
+        return false;
+    }
+    num_vertex_bindings = static_cast<u32>(bindings.size());
+    num_vertex_attributes = static_cast<u32>(attributes.size());
+    std::copy(bindings.begin(), bindings.end(), vertex_bindings.begin());
+    std::copy(attributes.begin(), attributes.end(), vertex_attributes.begin());
+    vertex_input_known = true;
+    return false;
+}
+
+void DynamicState::Commit(const Instance& instance, const CommandRecorder& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

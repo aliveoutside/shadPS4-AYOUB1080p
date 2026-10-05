@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <xxhash.h>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -144,6 +146,28 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     rasterizer->MapMemory(address, size);
 }
 
+std::vector<MemoryManager::MappedRange> MemoryManager::GetDataRanges() {
+    std::shared_lock lk{mutex};
+    std::vector<MappedRange> ranges;
+    for (const auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct && vma.type != VMAType::Flexible &&
+            vma.type != VMAType::Pooled) {
+            continue;
+        }
+        if (False(vma.prot & MemoryProt::CpuRead)) {
+            continue;
+        }
+        ranges.push_back(MappedRange{
+            .base = vma.base,
+            .size = vma.size,
+            .type = vma.type,
+            .prot = vma.prot,
+            .name = vma.name,
+        });
+    }
+    return ranges;
+}
+
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     const auto& backing_pages = impl.BackingPages();
     while (size) {
@@ -159,6 +183,24 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         virtual_addr += copy_size;
         dest += copy_size;
     }
+}
+
+u64 MemoryManager::HashSparseMemory(VAddr virtual_addr, u64 size) {
+    const auto& backing_pages = impl.BackingPages();
+    u64 hash = 0;
+    while (size) {
+        const u64 page = virtual_addr >> 14;
+        const u64 offset_in_page = virtual_addr % 16_KB;
+        const u64 chunk_size = std::min<u64>(16_KB - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            hash = XXH3_64bits_withSeed(*entry + offset_in_page, chunk_size, hash);
+        } else {
+            hash = XXH3_64bits_withSeed(&chunk_size, sizeof(chunk_size), hash ^ ~0ULL);
+        }
+        size -= chunk_size;
+        virtual_addr += chunk_size;
+    }
+    return hash;
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {

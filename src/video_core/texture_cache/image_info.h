@@ -33,6 +33,10 @@ struct ImageProperties {
     u32 is_block : 1;
     u32 is_depth : 1;
     u32 has_stencil : 1;
+    /// Render target created without the size hint of the command stream: its size is the
+    /// pitch and the aligned height of the buffer, which may exceed the real size (see
+    /// TextureCache::LearnTargetSize).
+    u32 size_from_pitch : 1;
 };
 
 struct ImageInfo {
@@ -82,6 +86,7 @@ struct ImageInfo {
         u32 offset;
     };
     std::array<MipInfo, 16> mips_layout;
+    u32 micro_tiled_mips{};
     VAddr guest_address{};
     u32 guest_size{};
     u8 bank_swizzle{};

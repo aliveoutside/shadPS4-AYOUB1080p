@@ -5,11 +5,13 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/perf_stats.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
+#include "core/perf_sampler.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
@@ -607,6 +609,9 @@ Frame* Presenter::PrepareLastFrame() {
         if (result == vk::Result::eTimeout) {
             continue;
         }
+        if (result == vk::Result::eErrorDeviceLost) {
+            GpuCrashDiag::ReportDeviceLost(instance, "frame wait");
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
     }
@@ -1067,7 +1072,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
-    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    info.AddWait(frame->ready_semaphore, frame->ready_tick,
+                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
@@ -1083,6 +1089,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        Common::Perf::OnFlip(DebugState.GetDrawCallsAvg(), DebugState.GetDispatchesAvg());
+        Core::PerfSampler::PollTuning();
     }
 }
 
@@ -1109,6 +1117,9 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            GpuCrashDiag::ReportDeviceLost(instance, "frame wait");
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out

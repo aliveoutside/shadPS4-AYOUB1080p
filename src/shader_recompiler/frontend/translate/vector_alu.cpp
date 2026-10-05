@@ -24,7 +24,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_SUBREV_F32:
         return V_SUBREV_F32(inst);
     case Opcode::V_MAC_LEGACY_F32:
-        return V_MAC_F32(inst);
+        return V_MAC_LEGACY_F32(inst);
     case Opcode::V_MUL_LEGACY_F32:
         return V_MUL_LEGACY_F32(inst);
     case Opcode::V_MUL_F32:
@@ -416,7 +416,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
 
         // VOP3a
     case Opcode::V_MAD_LEGACY_F32:
-        return V_MAD_F32(inst);
+        return V_MAD_LEGACY_F32(inst);
     case Opcode::V_MAD_F32:
         return V_MAD_F32(inst);
     case Opcode::V_MAD_I32_I24:
@@ -607,17 +607,38 @@ void Translator::V_MUL_F32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.FPMul(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1])));
 }
 
-void Translator::V_MUL_LEGACY_F32(const GcnInst& inst) {
-    // GCN V_MUL_LEGACY_F32: if either source is zero, the result is +0.0
+IR::F32 Translator::LegacyMul(const IR::F32& src0, const IR::F32& src1) {
+    // GCN legacy multiply: if either source is zero, the result is +0.0
     // regardless of the other operand (even if NaN or Inf).
     // Standard IEEE multiply would produce NaN for 0 * Inf.
-    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
-    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 zero{ir.Imm32(0.0f)};
     const IR::U1 src0_zero{ir.FPEqual(src0, zero)};
     const IR::U1 src1_zero{ir.FPEqual(src1, zero)};
     const IR::U1 either_zero{ir.LogicalOr(src0_zero, src1_zero)};
-    SetDst(inst.dst[0], IR::F32{ir.Select(either_zero, zero, ir.FPMul(src0, src1))});
+    return IR::F32{ir.Select(either_zero, zero, ir.FPMul(src0, src1))};
+}
+
+void Translator::V_MUL_LEGACY_F32(const GcnInst& inst) {
+    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
+    SetDst(inst.dst[0], LegacyMul(src0, src1));
+}
+
+void Translator::V_MAC_LEGACY_F32(const GcnInst& inst) {
+    // D = S0 * S1 + D with the legacy multiply (pow and safe normalizations rely on 0 * Inf = 0;
+    // an IEEE multiply turns those into NaN).
+    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
+    const IR::F32 dst0{GetSrc<IR::F32>(inst.dst[0])};
+    SetDst(inst.dst[0], ir.FPAdd(LegacyMul(src0, src1), dst0));
+}
+
+void Translator::V_MAD_LEGACY_F32(const GcnInst& inst) {
+    // D = S0 * S1 + S2 with the legacy multiply.
+    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
+    const IR::F32 src2{GetSrc<IR::F32>(inst.src[2])};
+    SetDst(inst.dst[0], ir.FPAdd(LegacyMul(src0, src1), src2));
 }
 
 void Translator::V_MUL_I32_I24(const GcnInst& inst, bool is_signed) {
@@ -786,19 +807,16 @@ void Translator::V_SUBREV_I32(const GcnInst& inst) {
 }
 
 void Translator::V_ADDC_U32(const GcnInst& inst) {
-    // Unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
-    const IR::Value tmp1{ir.IAddCarry(src0, src1)};
-    const IR::U32 result1{ir.CompositeExtract(tmp1, 0)};
-    const IR::U32 carry_out1{ir.CompositeExtract(tmp1, 1)};
-    const IR::Value tmp2{ir.IAddCarry(result1, carry)};
-    const IR::U32 result2{ir.CompositeExtract(tmp2, 0)};
-    const IR::U32 carry_out2{ir.CompositeExtract(tmp2, 1)};
+    const IR::U32 result1{ir.IAdd(src0, src1)};
+    const IR::U32 result2{ir.IAdd(result1, carry)};
+    const IR::U1 carry_out1{ir.ILessThan(result1, src0, false)};
+    const IR::U1 carry_out2{ir.ILessThan(result2, result1, false)};
     SetDst(inst.dst[0], result2);
 
-    const IR::U1 did_overflow{ir.INotEqual(ir.BitwiseOr(carry_out1, carry_out2), ir.Imm32(0))};
+    const IR::U1 did_overflow{ir.LogicalOr(carry_out1, carry_out2)};
     SetCarryOut(inst, did_overflow);
 }
 
@@ -1519,8 +1537,10 @@ void Translator::V_CVT_PK_U8_F32(const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 src2{GetSrc(inst.src[2])};
 
-    const IR::U32 value_uint = ir.ConvertFToU(32, src0);
-    const IR::U32 offset = ir.ShiftLeftLogical(src1, ir.Imm32(3));
+    const IR::F32 clamped{ir.FPClamp(ir.FPRoundEven(src0), ir.Imm32(0.0f), ir.Imm32(255.0f))};
+    const IR::F32 value{ir.Select(ir.FPIsNan(src0), ir.Imm32(0.0f), clamped)};
+    const IR::U32 value_uint{ir.ConvertFToU(32, value)};
+    const IR::U32 offset{ir.ShiftLeftLogical(ir.BitwiseAnd(src1, ir.Imm32(3)), ir.Imm32(3))};
     SetDst(inst.dst[0], ir.BitFieldInsert(src2, value_uint, offset, ir.Imm32(8)));
 }
 
@@ -1547,7 +1567,8 @@ void Translator::V_ALIGNBIT_B32(const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 src2{ir.BitwiseAnd(GetSrc(inst.src[2]), ir.Imm32(0x1F))};
     const IR::U32 lo{ir.ShiftRightLogical(src1, src2)};
-    const IR::U32 hi{ir.ShiftLeftLogical(src0, ir.ISub(ir.Imm32(32), src2))};
+    const IR::U32 hi{
+        ir.ShiftLeftLogical(ir.ShiftLeftLogical(src0, ir.Imm32(1)), ir.ISub(ir.Imm32(31), src2))};
     SetDst(inst.dst[0], ir.BitwiseOr(lo, hi));
 }
 
@@ -1557,7 +1578,8 @@ void Translator::V_ALIGNBYTE_B32(const GcnInst& inst) {
     const IR::U32 src2{ir.BitwiseAnd(GetSrc(inst.src[2]), ir.Imm32(0x3))};
     const IR::U32 shift{ir.ShiftLeftLogical(src2, ir.Imm32(3))};
     const IR::U32 lo{ir.ShiftRightLogical(src1, shift)};
-    const IR::U32 hi{ir.ShiftLeftLogical(src0, ir.ISub(ir.Imm32(32), shift))};
+    const IR::U32 hi{
+        ir.ShiftLeftLogical(ir.ShiftLeftLogical(src0, ir.Imm32(1)), ir.ISub(ir.Imm32(31), shift))};
     SetDst(inst.dst[0], ir.BitwiseOr(lo, hi));
 }
 

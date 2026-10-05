@@ -602,11 +602,11 @@ static PatchModule* GetModule(const void* ptr) {
     return &(std::prev(upper_bound)->second);
 }
 
-// Windows static guest red-zone protection
 static PatchModule* GetContainingModule(const void* ptr) {
     auto* module = GetModule(ptr);
-    const auto* address = static_cast<const u8*>(ptr);
-    return module != nullptr && address < module->end ? module : nullptr;
+    return module != nullptr && reinterpret_cast<u64>(ptr) < reinterpret_cast<u64>(module->end)
+               ? module
+               : nullptr;
 }
 
 /// Returns a boolean indicating whether the instruction was patched, and the offset to advance past
@@ -889,7 +889,9 @@ static bool TryExecuteIllegalInstruction(void* ctx, void* code_address) {
 
 static bool TryPatchJit(void* code_address) {
     auto* code = static_cast<u8*>(code_address);
-    auto* module = GetModule(code);
+    // A floor lookup alone also accepts host code and gaps between guest modules. Passing such
+    // an address to TryPatch can underflow its decode length and fault inside the decoder.
+    auto* module = GetContainingModule(code);
     if (module == nullptr) {
         return false;
     }
@@ -2130,21 +2132,21 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uint
 // ============================================================================
 
 static bool PatchesAccessViolationHandler(void* context, void* /* fault_address */) {
+    // An instruction-fetch fault does not provide readable instruction bytes to patch.
+    if (Common::IsExecuteError(context)) {
+        return false;
+    }
     return TryPatchJit(Common::GetRip(context));
 }
 
 static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
-#if defined(_WIN32)
-    // Windows static guest red-zone protection
-    const bool inspect_short_cpu_patch =
-        !WindowsGuestRedZoneProtection::IsStaticPatchingEnabled() ||
-        GetContainingModule(code_address) != nullptr;
-#else
-    constexpr bool inspect_short_cpu_patch = true;
-#endif
-    if (inspect_short_cpu_patch && // Windows static guest red-zone protection
-        Is4ByteExtrqOrInsertq(code_address)) {
+    const auto* module = GetContainingModule(code_address);
+    if (module == nullptr) {
+        return false;
+    }
+    const auto bytes_available = module->end - static_cast<const u8*>(code_address);
+    if (bytes_available >= 4 && Is4ByteExtrqOrInsertq(code_address)) {
         // The instruction is not big enough for a relative jump, don't try to patch it and pass it
         // to our illegal instruction interpreter directly
         return TryExecuteIllegalInstruction(context, code_address);
@@ -2152,8 +2154,8 @@ static bool PatchesIllegalInstructionHandler(void* context) {
         if (!TryPatchJit(code_address)) {
             ZydisDecodedInstruction instruction;
             ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-            const auto status =
-                Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+            const auto status = Common::Decoder::Instance()->decodeInstruction(
+                instruction, operands, code_address, bytes_available);
             if (ZYAN_SUCCESS(status)) {
                 const auto disassembled = Common::Decoder::Instance()->disassembleInst(
                     instruction, operands, std::bit_cast<u64>(code_address));

@@ -12,12 +12,27 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 6u;
+static constexpr u32 ShaderBinaryVersion = 8u; // 7: legacy multiply-add (v_mac_legacy_f32),
+                                                // 8: upstream ADDC/ALIGNBIT/CVT_PK_U8/thread id fixes
 static constexpr u32 ShaderMetaVersion = 6u;
 static constexpr u32 PipelineKeyVersion = 3u;
+
+/// Compute shaders compiled with a different recompiler variant (see SetComputeShaderVariant)
+/// are stored with another binary version, so changing the variant recompiles them once.
+static u32 compute_shader_variant{};
+
+static u32 BinaryVersionFor(const Shader::Info& info) {
+    return info.hw_stage == Shader::HwStage::Compute
+               ? ShaderBinaryVersion + compute_shader_variant * 100u
+               : ShaderBinaryVersion;
+}
 } // namespace Serialization
 
 namespace Vulkan {
+
+void SetComputeShaderVariant(u32 variant) {
+    Serialization::compute_shader_variant = variant;
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -69,7 +84,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(Serialization::BinaryVersionFor(info));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -103,7 +118,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version % 100u != Serialization::ShaderBinaryVersion) {
         return false;
     }
 
@@ -113,7 +128,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
-    return true;
+    // Compiled with another recompiler variant: compiled again.
+    return binary_version == Serialization::BinaryVersionFor(info);
 }
 
 void ComputePipelineKey::Serialize(Serialization::Archive& ar) const {
@@ -267,6 +283,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     vk::ShaderModule module{};
 
+    // The scout thread looks programs and their permutations up meanwhile.
+    std::unique_lock lock{program_cache_mutex};
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
         module = CompileSPV(spv, instance.GetDevice());
@@ -308,23 +326,31 @@ void PipelineCache::WarmUp() {
 
     Storage::DataBase::Instance().Open();
 
+    // Starts a fresh cache for the current profile, so it is filled during this session.
+    const auto start_new_cache = [this] {
+        Storage::DataBase::Instance().FinishPreload();
+        std::vector<u8> new_profile(sizeof(profile));
+        std::memcpy(new_profile.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(new_profile));
+    };
+
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     if (profile_data.empty()) {
-        Storage::DataBase::Instance().FinishPreload();
-
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+        start_new_cache();
         return;
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {
+        // Usually happens after an emulator update. Previously the cache was only ignored,
+        // which also disabled saving, so it was never rebuilt and every session recompiled
+        // every shader.
         LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
+                    "Pipeline cache profile has unexpected size ({} != {}). Rebuilding the cache",
                     profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
+        Storage::DataBase::Instance().Reset();
+        start_new_cache();
         return;
     }
 
@@ -332,8 +358,9 @@ void PipelineCache::WarmUp() {
     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
     if (cached_profile != profile) {
         LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+                    "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+        Storage::DataBase::Instance().Reset();
+        start_new_cache();
         return;
     }
 

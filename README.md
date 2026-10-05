@@ -1,211 +1,216 @@
 <!--
-SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+SPDX-FileCopyrightText: 2026 shadPS4-perf contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-<h1 align="center">
-  <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
-  <br>
-  <b>shadPS4</b>
-  <br>
-</h1>
+# shadPS4-perf
 
-<h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
-</h1>
+A fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator, tuned to run
+**inFAMOUS Second Son** smoothly.
 
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
+[English](#english) · [Français](#français)
 
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
+> **Unofficial, independent project.** It is not affiliated with, approved, endorsed or sponsored by
+> Sony Interactive Entertainment, Sucker Punch Productions or the shadPS4 team. PlayStation, PS4 and
+> inFAMOUS are trademarks of their respective owners.
+>
+> This project contains **no game files, no keys, no firmware, no system modules and no shader
+> caches**, and never will. Use it only with games you own, dumped from your own console.
+>
+> **Projet indépendant et non officiel**, non affilié ni approuvé par Sony Interactive Entertainment,
+> Sucker Punch Productions ou l'équipe de shadPS4. Aucun fichier de jeu, aucune clé, aucun firmware,
+> aucun module système ni cache de shaders. À utiliser uniquement avec vos propres jeux, extraits de
+> votre propre console.
 
-# General information
+## English
 
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+### What is different from shadPS4
 
-> [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+Based on shadPS4 commit `2338a06` (30 September 2026). The changes target the slowdowns of the city
+in inFAMOUS Second Son:
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+- **GPU readbacks** (the game reading data written by the GPU): copies on a second GPU queue, and the
+  game thread that needs the data waits for it instead of the emulated GPU; a game write over memory
+  the GPU wrote no longer waits for that memory to be downloaded first.
+- **Less work on the command processor thread**: Vulkan commands recorded by a thread of their own,
+  buffer uploads and page protections done by a worker thread, page protections of different threads
+  in parallel.
+- **Less repeated work per draw**: pipeline, shader, texture and render target lookups remembered,
+  redundant binds and empty draws skipped, small constant buffers reused instead of copied again.
+- **Shader compilation**: new graphics pipelines are compiled by worker threads; a draw whose pipeline
+  is not ready after a few milliseconds is skipped instead of freezing the game.
+- **Accuracy**: real occlusion queries (car headlights no longer shine through buildings), barriers
+  for compute shaders whose workgroups span several host subgroups (particle sorting), GPU clock read
+  by the game paced like the console so its dynamic quality system keeps the detail.
+- **CPU placement**: the GPU threads of the emulator run on the cores of the largest L3 cache (Ryzen
+  with 3D V-Cache) when the L3 caches differ in size.
+- **Built-in game fix**: the checkerboard rendering of the PS4 Pro mode, which shows a green screen in
+  shadPS4, is turned off for inFAMOUS Second Son, independently of patch files and launchers.
+- **Patch files**: a patch line can carry `OriginalHash`, a checksum of the bytes it replaces. On
+  another version of the game the patch is skipped instead of corrupting the code, and the patch file
+  does not need to contain any code of the game.
 
-# Status
+These options are switched on automatically for inFAMOUS Second Son (CUSA00004, CUSA00223). Other
+games keep the default values (most options off). This build is only tested with inFAMOUS Second Son.
 
-> [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+### Game patches
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+`user-files\patches\shadPS4-perf\inFAMOUS Second Son.xml` in the release zip, for the European game
+CUSA00004 (APP_VER 01.00):
 
-# Why
+| Patch | Default | What it does |
+| --- | --- | --- |
+| Dynamic quality thresholds x2 | on | the game no longer lowers its quality (sun shadows, resolution) in busy scenes: the limits of its dynamic quality system are doubled |
+| Anti-freeze guard (collision loop) | on | a collision query stops after 200 000 iterations instead of hanging the game |
+| Bigger light list | on | light lists sized for native 4K (the GPU hangs at 4K without it) |
+| Streaming: closest city blocks first | off | lower priority penalties in the streaming of the city blocks |
+| PS4 Pro mode: native 3200x1800 without checkerboard | on | native 3200x1800 rendering in PS4 Pro mode |
+| PS4 Pro mode: native 3840x2160 / 2560x1440 without checkerboard | off | heavier / lighter than 3200x1800, enable only one resolution patch |
+| Native 2560x1440 / 3840x2160 (render and output) | off | base PS4 mode (PS4 Pro mode off), enable only one resolution patch |
+| Wider field of view x1.15 / x1.30 | off | picture only, the game camera is unchanged, enable only one |
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+Switch a patch on or off with `isEnabled="true"` or `"false"` in the file, then restart the game.
+The checkerboard rendering of the PS4 Pro mode shows a green screen in shadPS4: this build turns it off
+by itself for this game, whatever the launcher or the patch files, so without a "PS4 Pro mode" patch
+the Pro mode renders in native 1920x1080. Without the PS4 Pro mode (`neo_mode` false) the game runs in
+1080p: switch the "PS4 Pro mode" patch off then.
 
-# Building
+### Install
 
-## Docker
+1. Download the zip of the latest [release](../../releases) and extract it anywhere.
+2. Copy the content of its `user-files` folder into your shadPS4 user folder, `%APPDATA%\shadPS4`
+   (or the `user` folder next to `shadps4.exe` for a portable install). It adds:
+   - `patches\shadPS4-perf\`: the game patches above;
+   - `custom_configs\CUSA00004.json`: the settings this build is tested with (PS4 Pro mode, precise
+     GPU readbacks, 512 MB of extra memory, pipeline cache). If you already have this file, add these
+     values to yours.
+3. Start the game with `shadps4.exe -g "<game folder>\CUSA00004\eboot.bin"`, or select this
+   `shadps4.exe` in your launcher (check that the patches are enabled there).
 
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
+The log (`%APPDATA%\shadPS4\log\shad_log.txt`) lists every patch applied ("Applied patch") or skipped.
 
-## Windows
+### Advanced settings
 
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
+- `perf_tuning.ini` in the user folder changes any performance option while the game runs (list and
+  descriptions in [`src/core/perf_sampler.h`](src/core/perf_sampler.h)); `perf_log = 1` writes
+  performance reports to the log.
+- Environment variable `SHADPS4_GAME_PROFILE=0`: start without the inFAMOUS Second Son settings and
+  built-in fix.
 
-## Linux
+### Build from source
 
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
+As for shadPS4: clone with the submodules (`git clone --recursive`), then follow
+[documents/building-windows.md](documents/building-windows.md) (Linux and macOS: the other files of
+`documents`). Releases are built from the commit of their tag with clang-cl, CMake and Ninja
+(`-DCMAKE_BUILD_TYPE=Release`).
 
-## macOS
+### License
 
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
+GPL-2.0-or-later, like shadPS4 ([LICENSE](LICENSE)). The source code of a release is the commit of its
+tag in this repository.
 
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
+### Credits
 
-# Usage examples
+- The [shadPS4](https://github.com/shadps4-emu/shadPS4) team and contributors, who make the emulator.
+- Changes by Ayoub ([@weshayoub92](https://github.com/weshayoub92)), developed with the help of Claude
+  (Anthropic).
 
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
+## Français
 
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
+### Ce qui change par rapport à shadPS4
 
-Below is a list of commonly used command patterns:
-```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
-```
+Basé sur le commit `2338a06` de shadPS4 (30 septembre 2026). Les changements visent les
+ralentissements de la ville dans inFAMOUS Second Son :
 
-# Debugging and reporting issues
+- **Relectures GPU** (le jeu lit des données écrites par le GPU) : copies sur une seconde file GPU, et
+  c'est le thread du jeu qui a besoin des données qui les attend, pas le GPU émulé ; une écriture du
+  jeu sur de la mémoire écrite par le GPU n'attend plus que cette mémoire soit d'abord rapatriée.
+- **Moins de travail sur le thread du processeur de commandes** : commandes Vulkan enregistrées par
+  un thread dédié, envois de tampons et protections de pages faits par un thread de travail,
+  protections de pages de plusieurs threads en parallèle.
+- **Moins de travail répété à chaque dessin** : recherches de pipelines, de shaders, de textures et de
+  cibles de rendu mémorisées, liaisons redondantes et dessins vides ignorés, petits tampons de
+  constantes réutilisés au lieu d'être recopiés.
+- **Compilation des shaders** : les nouveaux pipelines graphiques sont compilés par des threads
+  dédiés ; un dessin dont le pipeline n'est pas prêt après quelques millisecondes est sauté au lieu de
+  figer le jeu.
+- **Précision** : vrais tests d'occlusion (les phares des voitures ne traversent plus les bâtiments),
+  barrières pour les shaders de calcul dont les groupes couvrent plusieurs sous-groupes de l'hôte (tri
+  des particules), horloge GPU lue par le jeu au rythme de la console pour que son système de qualité
+  dynamique garde les détails.
+- **Placement sur le processeur** : les threads GPU de l'émulateur tournent sur les cœurs du plus grand
+  cache L3 (Ryzen avec 3D V-Cache) quand les caches L3 n'ont pas la même taille.
+- **Correctif intégré** : le rendu en damier du mode PS4 Pro, qui donne un écran vert dans shadPS4, est
+  coupé pour inFAMOUS Second Son, indépendamment des fichiers de patchs et des lanceurs.
+- **Fichiers de patchs** : une ligne de patch peut porter `OriginalHash`, une somme de contrôle des
+  octets qu'elle remplace. Sur une autre version du jeu, le patch est ignoré au lieu d'abîmer le code,
+  et le fichier de patchs n'a besoin de contenir aucun code du jeu.
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+Ces options s'activent automatiquement pour inFAMOUS Second Son (CUSA00004, CUSA00223). Les autres jeux
+gardent les valeurs par défaut (la plupart des options désactivées). Cette build n'est testée qu'avec
+inFAMOUS Second Son.
 
-# Keyboard and Mouse Mappings
+### Patchs du jeu
 
-> [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+`user-files\patches\shadPS4-perf\inFAMOUS Second Son.xml` dans le zip de la release, pour le jeu
+européen CUSA00004 (APP_VER 01.00) :
 
-| Button | Function |
-|-------------|-------------|
-F10 | FPS Counter
-Ctrl+F10 | Video Debug Info
-F11 | Fullscreen
-F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
-Alt+F12 | Capture screenshot including HUD/dialog overlays
+| Patch | Par défaut | Effet |
+| --- | --- | --- |
+| Dynamic quality thresholds x2 | activé | le jeu ne baisse plus sa qualité (ombres du soleil, résolution) dans les scènes chargées : les limites de son système de qualité dynamique sont doublées |
+| Anti-freeze guard (collision loop) | activé | un calcul de collisions s'arrête au bout de 200 000 tours au lieu de figer le jeu |
+| Bigger light list | activé | listes de lumières dimensionnées pour la 4K native (sans lui, le GPU se bloque en 4K) |
+| Streaming: closest city blocks first | désactivé | priorités du chargement des blocs de la ville moins pénalisantes |
+| PS4 Pro mode: native 3200x1800 without checkerboard | activé | rendu natif en 3200x1800 en mode PS4 Pro |
+| PS4 Pro mode: native 3840x2160 / 2560x1440 without checkerboard | désactivé | plus lourd / plus léger que 3200x1800, n'activer qu'un seul patch de résolution |
+| Native 2560x1440 / 3840x2160 (render and output) | désactivé | mode PS4 de base (mode PS4 Pro désactivé), n'activer qu'un seul patch de résolution |
+| Wider field of view x1.15 / x1.30 | désactivé | image seulement, la caméra du jeu ne change pas, n'en activer qu'un |
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
+Pour activer ou désactiver un patch : `isEnabled="true"` ou `"false"` dans le fichier, puis relancer le
+jeu. Le rendu en damier du mode PS4 Pro donne un écran vert dans shadPS4 : cette build le coupe
+d'elle-même pour ce jeu, quels que soient le lanceur et les fichiers de patchs ; sans patch « PS4 Pro
+mode », le mode Pro rend donc en 1920x1080 natif. Sans le mode PS4 Pro (`neo_mode` à false), le jeu tourne
+en 1080p : désactiver alors le patch « PS4 Pro mode ».
 
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
+### Installation
 
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
+1. Télécharger le zip de la dernière [release](../../releases) et l'extraire où vous voulez.
+2. Copier le contenu de son dossier `user-files` dans votre dossier utilisateur de shadPS4,
+   `%APPDATA%\shadPS4` (ou le dossier `user` à côté de `shadps4.exe` pour une installation portable).
+   Il ajoute :
+   - `patches\shadPS4-perf\` : les patchs du jeu ci-dessus ;
+   - `custom_configs\CUSA00004.json` : les réglages avec lesquels cette build est testée (mode PS4 Pro,
+     relectures GPU précises, 512 Mo de mémoire en plus, cache de pipelines). Si vous avez déjà ce
+     fichier, ajoutez-y ces valeurs.
+3. Lancer le jeu avec `shadps4.exe -g "<dossier du jeu>\CUSA00004\eboot.bin"`, ou choisir ce
+   `shadps4.exe` dans votre lanceur (vérifiez que les patchs y sont activés).
 
+Le journal (`%APPDATA%\shadPS4\log\shad_log.txt`) indique chaque patch appliqué (« Applied patch ») ou
+ignoré.
 
-# Firmware files
+### Réglages avancés
 
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
+- `perf_tuning.ini` dans le dossier utilisateur modifie n'importe quelle option de performance pendant
+  le jeu (liste et descriptions dans [`src/core/perf_sampler.h`](src/core/perf_sampler.h)) ;
+  `perf_log = 1` écrit des rapports de performance dans le journal.
+- Variable d'environnement `SHADPS4_GAME_PROFILE=0` : démarrer sans les réglages ni le correctif intégré
+  d'inFAMOUS Second Son.
 
-<div align="center">
+### Compiler depuis les sources
 
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
-| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
-</div>
+Comme pour shadPS4 : cloner avec les sous-modules (`git clone --recursive`), puis suivre
+[documents/building-windows.md](documents/building-windows.md) (Linux et macOS : les autres fichiers de
+`documents`). Les releases sont compilées depuis le commit de leur tag avec clang-cl, CMake et Ninja
+(`-DCMAKE_BUILD_TYPE=Release`).
 
-> [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
+### Licence
 
+GPL-2.0 ou ultérieure, comme shadPS4 ([LICENSE](LICENSE)). Le code source d'une release est le commit
+de son tag dans ce dépôt.
 
+### Remerciements
 
-# Main team
-
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
-
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
-
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
-</a>
-
-# Contributing
-
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
-
-
-# Special Thanks
-
-A few noteworthy teams/projects who've helped us along the way are:
-
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
-
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
-
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
-
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
-
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
-
-# License
-
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+- L'équipe et les contributeurs de [shadPS4](https://github.com/shadps4-emu/shadPS4), qui font
+  l'émulateur.
+- Changements par Ayoub ([@weshayoub92](https://github.com/weshayoub92)), développés avec l'aide de
+  Claude (Anthropic).

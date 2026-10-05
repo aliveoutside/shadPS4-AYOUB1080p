@@ -49,7 +49,9 @@ bool IsWriteError(void* ctx) {
 
 bool IsExecuteError(void* ctx) {
 #if defined(_WIN32)
-    return ((EXCEPTION_POINTERS*)ctx)->ExceptionRecord->ExceptionInformation[0] == 0xf;
+    const auto* record = static_cast<EXCEPTION_POINTERS*>(ctx)->ExceptionRecord;
+    return record->NumberParameters >= 1 &&
+           record->ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT;
 #elif defined(__APPLE__) && defined(ARCH_X86_64)
     return ((ucontext_t*)ctx)->uc_mcontext->__es.__err & 0x10;
 #elif defined(__FreeBSD__) && defined(ARCH_X86_64)

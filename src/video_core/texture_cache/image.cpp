@@ -3,6 +3,8 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/perf_stats.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -129,6 +131,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
+    Common::Perf::Add(Common::Perf::ImageCreates);
 
     image_uid = global_image_uid.Next();
     mip_hashes.resize(info.resources.levels);
@@ -225,79 +228,151 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                         std::optional<SubresourceRange> subres_range) {
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    auto& dirty = backing->dirty_subresources;
+    Common::Perf::Add(Common::Perf::BarrierCalls);
+    const size_t barriers_before = barriers.size();
+    SCOPE_EXIT {
+        if (barriers.size() != barriers_before) {
+            Common::Perf::Add(Common::Perf::BarriersEmitted, barriers.size() - barriers_before);
+        }
+    };
+
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    const auto needs_barrier = [&](const State& state) {
+        const bool is_write = static_cast<bool>(state.access_mask & write_flags);
+        return state.layout != dst_layout || state.access_mask != dst_mask || is_write;
+    };
+    const auto transition = [&](State& state, u32 mip, u32 layer) {
+        // NOTE: this may produce a lot of small barriers.
+        // If this becomes a problem, we can optimize it by merging adjacent barriers.
+        barriers.emplace_back(vk::ImageMemoryBarrier2{
+            .srcStageMask = state.pl_stage,
+            .srcAccessMask = state.access_mask,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_mask,
+            .oldLayout = state.layout,
+            .newLayout = dst_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = GetImage(),
+            .subresourceRange{
+                .aspectMask = aspect_mask,
+                .baseMipLevel = mip,
+                .levelCount = 1,
+                .baseArrayLayer = layer,
+                .layerCount = 1,
+            },
+        });
+        state.layout = dst_layout;
+        state.access_mask = dst_mask;
+        state.pl_stage = dst_stage;
+        ++backing->state_version;
+    };
 
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
 
+    if (needs_partial_transition && !partially_transited && !needs_barrier(last_state)) {
+        // The whole image is in a single state. A sub range that is already in the requested
+        // state needs no barrier, and splitting the state per subresource here would make every
+        // later full transition walk all subresources (common when sampling one layer or one mip
+        // of an image every draw).
+        Common::Perf::Add(Common::Perf::BarrierFastPath);
+        last_state.pl_stage |= dst_stage;
+        return;
+    }
+
+    if (needs_partial_transition && partially_transited) {
+        // A sub range that is already in the requested state is common when the same view of a
+        // partially transited image is bound by every draw: skip walking it again.
+        const auto& memo = backing->last_partial;
+        if (memo.valid && memo.version == backing->state_version && memo.range == *subres_range &&
+            memo.layout == dst_layout && memo.access == dst_mask && memo.stage == dst_stage &&
+            !(dst_mask & write_flags)) {
+            Common::Perf::Add(Common::Perf::BarrierMemoHit);
+            last_state.layout = dst_layout;
+            last_state.access_mask = dst_mask;
+            last_state.pl_stage = dst_stage;
+            return;
+        }
+    }
+
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
-            std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            subresource_states.assign(info.resources.levels * info.resources.layers, last_state);
+            backing->partial_base_state = last_state;
+            dirty.clear();
+            backing->dirty_overflow = false;
+            ++backing->state_version;
         }
 
-        // In case of partial transition, we need to change the specified subresources only.
-        // Otherwise all subresources need to be set to the same state so we can use a full
-        // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
-
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
-                // NOTE: these loops may produce a lot of small barriers.
-                // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
-                ASSERT(subres_idx < subresource_states.size());
+        if (!needs_partial_transition && !backing->dirty_overflow &&
+            !needs_barrier(backing->partial_base_state)) {
+            // Full transition of an image whose untouched subresources are already in the
+            // requested state: only the subresources changed since the image stopped being
+            // uniform can need a barrier.
+            Common::Perf::Add(Common::Perf::BarrierDirtyPath);
+            for (const u32 subres_idx : dirty) {
                 auto& state = subresource_states[subres_idx];
+                if (needs_barrier(state)) {
+                    transition(state, subres_idx / info.resources.layers,
+                               subres_idx % info.resources.layers);
+                }
+            }
+        } else {
+            // In case of partial transition, we need to change the specified subresources only.
+            // Otherwise all subresources need to be set to the same state so we can use a full
+            // resource transition for the next time.
+            const auto mips = needs_partial_transition
+                                  ? std::ranges::views::iota(subres_range->base.level,
+                                                             subres_range->base.level +
+                                                                 subres_range->extent.levels)
+                                  : std::views::iota(0u, info.resources.levels);
+            const auto layers = needs_partial_transition
+                                    ? std::ranges::views::iota(subres_range->base.layer,
+                                                               subres_range->base.layer +
+                                                                   subres_range->extent.layers)
+                                    : std::views::iota(0u, info.resources.layers);
 
-                constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                             vk::AccessFlagBits2::eShaderWrite |
-                                             vk::AccessFlagBits2::eMemoryWrite;
-                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
-                    barriers.emplace_back(vk::ImageMemoryBarrier2{
-                        .srcStageMask = state.pl_stage,
-                        .srcAccessMask = state.access_mask,
-                        .dstStageMask = dst_stage,
-                        .dstAccessMask = dst_mask,
-                        .oldLayout = state.layout,
-                        .newLayout = dst_layout,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
-                        .subresourceRange{
-                            .aspectMask = aspect_mask,
-                            .baseMipLevel = mip,
-                            .levelCount = 1,
-                            .baseArrayLayer = layer,
-                            .layerCount = 1,
-                        },
-                    });
-                    state.layout = dst_layout;
-                    state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
+            Common::Perf::Add(Common::Perf::BarrierSubresources,
+                              static_cast<u64>(std::ranges::distance(mips)) *
+                                  static_cast<u64>(std::ranges::distance(layers)));
+            for (u32 mip : mips) {
+                for (u32 layer : layers) {
+                    const u32 subres_idx = mip * info.resources.layers + layer;
+                    ASSERT(subres_idx < subresource_states.size());
+                    auto& state = subresource_states[subres_idx];
+                    if (!needs_barrier(state)) {
+                        continue;
+                    }
+                    transition(state, mip, layer);
+                    if (needs_partial_transition && !backing->dirty_overflow &&
+                        std::ranges::find(dirty, subres_idx) == dirty.end()) {
+                        if (dirty.size() < 64) {
+                            dirty.push_back(subres_idx);
+                        } else {
+                            backing->dirty_overflow = true;
+                        }
+                    }
                 }
             }
         }
 
         if (!needs_partial_transition) {
             subresource_states.clear();
+            dirty.clear();
+            backing->dirty_overflow = false;
+            backing->last_partial.valid = false;
+        } else {
+            backing->last_partial = {*subres_range,          dst_layout, dst_mask, dst_stage,
+                                     backing->state_version, true};
         }
     } else { // Full resource transition
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+        if (!needs_barrier(last_state)) {
             return;
         }
         barriers.emplace_back(vk::ImageMemoryBarrier2{

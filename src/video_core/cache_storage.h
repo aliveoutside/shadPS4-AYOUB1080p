@@ -28,6 +28,8 @@ public:
 
     void Open();
     void Close();
+    /// Moves the current (incompatible) cache aside and reopens an empty one.
+    void Reset();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }

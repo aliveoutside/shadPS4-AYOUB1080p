@@ -65,6 +65,7 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
     size.height = hint.Valid() ? hint.height : buffer.Height();
     size.depth = 1;
     pitch = buffer.Pitch();
+    props.size_from_pitch = !hint.Valid();
     resources.layers = buffer.NumSlices();
     meta_info.cmask_addr = buffer.info.fast_clear ? buffer.CmaskAddress() : 0;
     meta_info.fmask_addr = buffer.info.compression ? buffer.FmaskAddress() : 0;
@@ -97,6 +98,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     size.height = hint.Valid() ? hint.height : buffer.Height();
     size.depth = 1;
     pitch = buffer.Pitch();
+    props.size_from_pitch = !hint.Valid();
     resources.layers = num_slices;
     meta_info.htile_addr = buffer.z_info.tile_surface_enable ? htile_address : 0;
 
@@ -157,6 +159,7 @@ void ImageInfo::UpdateSize() {
     const u32 thickness = AmdGpu::GetMicroTileThickness(array_mode);
     const bool macro = AmdGpu::IsMacroTiled(array_mode);
     guest_size = 0;
+    micro_tiled_mips = 0;
     for (s32 mip = 0; mip < resources.levels; ++mip) {
         u32 mip_w = pitch >> mip;
         u32 mip_h = size.height >> mip;
@@ -175,25 +178,30 @@ void ImageInfo::UpdateSize() {
         }
 
         auto& mip_info = mips_layout[mip];
+        u32 mip_thickness = 1;
         if (array_mode == AmdGpu::ArrayMode::ArrayLinearAligned) {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
                 ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
+        } else if (macro &&
+                   IsMacroTiledMip(mip_w, mip_h, num_bits, num_samples, tile_mode, mip, alt_tile)) {
+            mip_thickness = thickness;
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeMacroTiled(mip_w, mip_h, num_bits, num_samples, tile_mode, alt_tile);
         } else {
-            mip_d += (-mip_d) & (thickness - 1);
+            mip_thickness = std::min(thickness, 4u);
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeMicroTiled(mip_w, mip_h, mip_thickness, num_bits, num_samples);
             if (macro) {
-                ASSERT(!props.is_block);
-                std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
-                    mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
-            } else {
-                std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
-                    ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
+                micro_tiled_mips |= 1u << mip;
             }
         }
         if (props.is_block) {
             mip_info.pitch = std::max(mip_info.pitch * 4, 32u);
             mip_info.height = std::max(mip_info.height * 4, 32u);
         }
-        mip_info.size *= mip_d * resources.layers;
+        u32 num_slices = mip_d * resources.layers;
+        num_slices += (-num_slices) & (mip_thickness - 1);
+        mip_info.size *= num_slices;
         mip_info.offset = guest_size;
         guest_size += mip_info.size;
     }

@@ -37,6 +37,12 @@ struct patchInfo {
     bool littleEndian;
     PatchMask patchMask;
     int maskOffset;
+    /// Optional bytes expected at the patched address (hex). The patch is skipped when they
+    /// differ, so a patch made for another version of the executable cannot corrupt the code.
+    std::string originalStr{};
+    /// Optional FNV-1a 64-bit hash (hex) of the bytes the patch writes over: same check as
+    /// originalStr, without the patch file carrying the bytes of the game.
+    std::string originalHashStr{};
 };
 
 std::string convertValueToHex(const std::string type, const std::string valueStr);
@@ -44,7 +50,9 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 void OnGameLoaded();
 void AddPatchToQueue(const patchInfo& patchToAdd);
 
-void PatchMemory(const patchInfo& patch);
+/// Returns false when the patch was not applied (bad address or value, or the bytes at the
+/// address are not the expected ones).
+bool PatchMemory(const patchInfo& patch);
 
 static std::vector<int32_t> PatternToByte(const std::string& pattern);
 uintptr_t PatternScan(const std::string& signature);

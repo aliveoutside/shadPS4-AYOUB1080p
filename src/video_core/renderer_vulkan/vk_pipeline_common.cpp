@@ -21,7 +21,12 @@ Pipeline::~Pipeline() = default;
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
-    const auto cmdbuf = scheduler.CommandBuffer();
+    BindResources(scheduler, set_writes, push_data);
+}
+
+void Pipeline::BindResources(Scheduler& on, DescriptorWrites& set_writes,
+                             const Shader::PushData& push_data) const {
+    const auto cmdbuf = on.Recorder();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
@@ -38,6 +43,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         return;
     }
 
+    ASSERT_MSG(&on == &scheduler, "Descriptor sets are recycled with the pipeline's scheduler");
     const auto desc_set = desc_heap.Commit(*desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;

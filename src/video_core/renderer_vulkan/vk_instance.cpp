@@ -210,7 +210,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDeviceFaultFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -353,6 +354,12 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
+    // GPU crash diagnostics, both cost nothing until used.
+    diagnostic_checkpoints = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    const auto fault_features = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
+    device_fault = fault_features.deviceFault && add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    // Only probed (BufferCache::ProbeHostImport): can the GPU use guest memory in place?
+    external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -376,10 +383,17 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // A second queue of the graphics family runs the GPU readback copies, so they only wait for
+    // the submission that wrote the data instead of all the work recorded since. A third one
+    // runs the compute work of the guest's asynchronous compute queues alongside the graphics
+    // work, as the PS4 does (asc_queue).
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f};
+    const u32 family_queues = family_properties[queue_family_index].queueCount;
+    has_readback_queue = family_queues >= 2;
+    has_compute_queue = family_queues >= 3;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = std::min<u32>(family_queues, 3u),
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -411,6 +425,7 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                .occlusionQueryPrecise = features.occlusionQueryPrecise,
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
@@ -526,6 +541,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -577,6 +595,9 @@ bool Instance::CreateDevice() {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -589,6 +610,14 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (has_readback_queue) {
+        readback_queue = device->getQueue(queue_family_index, 1);
+    }
+    if (has_compute_queue) {
+        compute_queue = device->getQueue(queue_family_index, 2);
+    }
+    LOG_INFO(Render_Vulkan, "Readback queue: {}, compute queue: {}",
+             has_readback_queue ? "available" : "none", has_compute_queue ? "available" : "none");
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

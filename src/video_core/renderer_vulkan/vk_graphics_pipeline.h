@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -90,8 +92,10 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
-    ~GraphicsPipeline();
+                     bool preloading, bool defer_compile = false);
+    ~GraphicsPipeline() override;
+
+    void Compile() override;
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -112,8 +116,17 @@ private:
     void BuildDescSetLayout(bool preloading);
 
 private:
+    /// What Compile() needs once the constructor returned, released after compilation.
+    struct BuildData {
+        SerializationSupport sdata;
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        vk::PipelineCache pipeline_cache;
+        bool discard_fragment{};
+    };
+
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    std::unique_ptr<BuildData> build;
 };
 
 struct ClipDistanceShaderKey {

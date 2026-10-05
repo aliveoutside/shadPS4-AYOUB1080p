@@ -30,7 +30,7 @@ namespace VideoCore {
 
 struct TilingInfo {
     u32 bank_swizzle;
-    u32 num_slices;
+    u32 micro_tiled_mips;
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
 };
@@ -201,7 +201,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
+    params.micro_tiled_mips = info.micro_tiled_mips;
     params.num_mips = info.resources.levels;
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
@@ -224,7 +224,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     scheduler.EndRendering();
     runtime.FlushBarriers();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Recorder();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -268,6 +268,17 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (Vulkan::GpuCrashDiag::Enabled()) {
+        Vulkan::GpuCrashDiag::Mark(
+            cmdbuf, scheduler.CurrentTick(),
+            Vulkan::GpuCrashDiag::Entry{
+                .kind = Vulkan::GpuCrashDiag::Kind::Detile,
+                .count = static_cast<u32>(dim_x),
+                .dims = {info.size.width, info.size.height,
+                         info.props.is_volume ? info.size.depth : info.resources.layers},
+                .address = info.guest_address,
+            });
+    }
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
@@ -290,7 +301,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
+    params.micro_tiled_mips = info.micro_tiled_mips;
     params.num_mips = static_cast<u32>(buffer_copies.size());
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
@@ -316,7 +327,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
     runtime.FlushBarriers();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.Recorder();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -360,6 +371,17 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (Vulkan::GpuCrashDiag::Enabled()) {
+        Vulkan::GpuCrashDiag::Mark(
+            cmdbuf, scheduler.CurrentTick(),
+            Vulkan::GpuCrashDiag::Entry{
+                .kind = Vulkan::GpuCrashDiag::Kind::Tile,
+                .count = static_cast<u32>(dim_x),
+                .dims = {info.size.width, info.size.height,
+                         info.props.is_volume ? info.size.depth : info.resources.layers},
+                .address = info.guest_address,
+            });
+    }
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,

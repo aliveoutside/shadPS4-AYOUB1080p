@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -45,6 +47,33 @@ public:
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
+
+    /**
+     * Deferred protection: while a vector is set (by the calling thread, null to stop), the write
+     * protection this thread adds again to pages (after uploading them) is not applied: their
+     * ranges of page numbers [first, end) are added to the vector instead, for
+     * RefreshDeferredProtect, and the pages are marked so that any other change of their
+     * watchers applies it at once. The guest may write the pages until then without a fault:
+     * whoever applies it must read their content only afterwards.
+     */
+    static void DeferProtect(std::vector<std::pair<u64, u64>>* deferred_pages);
+
+    /// Applies the deferred protections of the pages [first_page, end_page) not applied yet.
+    /// Returns the number of pages protected.
+    u64 RefreshDeferredProtect(u64 first_page, u64 end_page) const;
+
+    /**
+     * Late protection (Tuning::late_protect), for a region lock section: from BeginLateProtect,
+     * called with the region locked, the protections UpdatePageWatchersForRegion decides are not
+     * applied at once: their pages stay locked, and EndLateProtect, called right after the region
+     * lock is released, applies them and unlocks the pages. The system calls no longer run under
+     * the region lock (other threads faulting in the region, the command processor), while each
+     * page still gets its protections in the order of its watcher changes. Between the two, the
+     * calling thread takes no other lock. BeginLateProtect returns false when late protection is
+     * off or already begun (nothing to end then).
+     */
+    bool BeginLateProtect() const;
+    void EndLateProtect() const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

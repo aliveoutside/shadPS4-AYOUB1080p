@@ -75,6 +75,25 @@ public:
         return present_queue;
     }
 
+    /// Second queue of the graphics family used for GPU readback copies, if available.
+    bool HasReadbackQueue() const {
+        return has_readback_queue;
+    }
+
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
+    /// Third queue of the graphics family, for the compute work of the asynchronous compute
+    /// queues of the guest (asc_queue), if available.
+    bool HasComputeQueue() const {
+        return has_compute_queue;
+    }
+
+    vk::Queue GetComputeQueue() const {
+        return compute_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -226,6 +245,16 @@ public:
     /// Returns true if 64-bit integer atomic operations can be used on shared memory
     bool IsSharedInt64AtomicsSupported() const {
         return vk12_features.shaderSharedInt64Atomics;
+    }
+
+    /// Returns true if occlusion queries can return exact sample counts
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// Returns true if queries can be reset from the host
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
     }
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
@@ -436,6 +465,21 @@ public:
     }
 
     /// Returns whether VK_EXT_image_view_min_lod is supported.
+    /// Returns true when VK_NV_device_diagnostic_checkpoints is enabled.
+    bool HasDiagnosticCheckpoints() const {
+        return diagnostic_checkpoints;
+    }
+
+    /// Returns true when VK_EXT_external_memory_host is enabled.
+    bool HasExternalMemoryHost() const {
+        return external_memory_host;
+    }
+
+    /// Returns true when VK_EXT_device_fault is enabled.
+    bool HasDeviceFault() const {
+        return device_fault;
+    }
+
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
     }
@@ -503,6 +547,10 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    bool has_readback_queue{};
+    vk::Queue compute_queue;
+    bool has_compute_queue{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -533,6 +581,9 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool diagnostic_checkpoints{};
+    bool device_fault{};
+    bool external_memory_host{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

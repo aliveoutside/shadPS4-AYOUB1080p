@@ -3,8 +3,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <shared_mutex>
 #include <variant>
 #include <tsl/robin_map.h>
+#include <unordered_set>
+#include <xxhash.h>
+#include "video_core/amdgpu/scout.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -37,6 +42,28 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+class PipelineCompiler;
+
+/// Key of the texture binding memo (Rasterizer::BindTextures, Tuning::tex_memo) for binding
+/// `index` of an image resource with this T#: what the image description depends on, without
+/// padding bytes. Also computed by the scout thread for the stages it precomputes.
+inline u64 TexMemoKey(const AmdGpu::Image& tsharp, u32 index,
+                      const Shader::ImageResource& image_desc) noexcept {
+    struct KeyData {
+        AmdGpu::Image tsharp;
+        u32 index;
+        u32 flags;
+    } key_data{
+        .tsharp = tsharp,
+        .index = index,
+        .flags = (image_desc.is_depth ? 1u : 0u) | (image_desc.is_array ? 2u : 0u) |
+                 (image_desc.is_written ? 4u : 0u) |
+                 (static_cast<u32>(image_desc.mip_fallback_mode) << 8) |
+                 (static_cast<u32>(image_desc.constant_mip_index) << 16),
+    };
+    static_assert(sizeof(KeyData) == sizeof(AmdGpu::Image) + 8);
+    return XXH3_64bits(&key_data, sizeof(key_data)) | 1;
+}
 
 struct Program {
     struct Module {
@@ -48,6 +75,59 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+
+    /// Permutation memo (Tuning::spec_memo): hash of the resource descriptors, runtime info and
+    /// start bindings of recent bindings of this program, and the permutation they selected.
+    /// Written by the command processor only, also read by the scout thread: each entry is a
+    /// sequence lock (odd while being written).
+    struct MemoEntry {
+        std::atomic<u32> seq{};
+        std::atomic<u32> perm_idx{};
+        std::atomic<u64> key{};
+        std::atomic<bool> valid{};
+    };
+    static constexpr size_t NumMemoEntries = 16;
+    std::array<MemoEntry, NumMemoEntries> memo{};
+    u32 memo_next{}; ///< Command processor only.
+
+    /// Command processor: remembers the permutation of a key (oldest entry replaced).
+    void WriteMemo(u64 key, u32 perm_idx) noexcept {
+        auto& entry = memo[memo_next];
+        const u32 seq = entry.seq.load(std::memory_order_relaxed);
+        entry.seq.store(seq + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        entry.key.store(key, std::memory_order_relaxed);
+        entry.perm_idx.store(perm_idx, std::memory_order_relaxed);
+        entry.valid.store(true, std::memory_order_relaxed);
+        entry.seq.store(seq + 2, std::memory_order_release);
+        memo_next = (memo_next + 1) % NumMemoEntries;
+    }
+
+    /// Scout thread: the permutation remembered for the key, read consistently, most recent
+    /// entries first.
+    bool ReadMemo(u64 key, u32& perm_idx) const noexcept {
+        for (size_t n = 0; n < NumMemoEntries; ++n) {
+            // memo_next is the command processor's: a stale value only changes the order.
+            const auto& entry =
+                memo[(NumMemoEntries + memo_next - 1 - n) % NumMemoEntries];
+            const u32 seq = entry.seq.load(std::memory_order_acquire);
+            if ((seq & 1) != 0) {
+                continue;
+            }
+            const bool valid = entry.valid.load(std::memory_order_relaxed);
+            const u64 entry_key = entry.key.load(std::memory_order_relaxed);
+            const u32 entry_perm = entry.perm_idx.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (entry.seq.load(std::memory_order_relaxed) != seq) {
+                continue;
+            }
+            if (valid && entry_key == key) {
+                perm_idx = entry_perm;
+                return true;
+            }
+        }
+        return false;
+    }
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -69,11 +149,15 @@ struct DrawIndirectParams {
     u32 instance_sgpr_offset;
 };
 
-class PipelineCache {
+class PipelineCache : public AmdGpu::ScoutClient {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
-    ~PipelineCache();
+    ~PipelineCache() override;
+
+    /// Scout thread: the shader stage lookups of a draw, from the registers at that draw.
+    void ScoutDraw(const AmdGpu::Regs& regs, AmdGpu::ScoutDraw& draw,
+                   AmdGpu::ScoutArena& arena) override;
 
     void WarmUp();
     void Sync();
@@ -100,10 +184,34 @@ public:
         return profile;
     }
 
+    /// The scout stage taken as is (scout_fast) for this stage info in the current draw, null
+    /// when the stage was looked up by the command processor: the scout's precomputed resource
+    /// lookups (Tuning::bind_prefetch) apply to the info's bindings.
+    const AmdGpu::ScoutStage* TakenScoutStage(const Shader::Info& info) const noexcept {
+        for (size_t i = 0; i < taken_scout_infos.size(); ++i) {
+            if (taken_scout_infos[i] == &info) {
+                return taken_scout_stages[i];
+            }
+        }
+        return nullptr;
+    }
+
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
+
+    /// AmdGpu::GetParams of a stage program, through the params memo (shader_params_memo,
+    /// command processor thread only).
+    template <typename ProgramRegs>
+    Shader::ShaderParams GetStageParams(const ProgramRegs& pgm);
+
+    /// Tuning::scout_fast: the stage lookup the scout thread resolved for this draw, taken as
+    /// is when its inputs are the command processor's (fills infos, modules, the key's stage
+    /// hash and the bindings). False: GetProgram as usual.
+    template <typename ProgramRegs>
+    bool TakeScoutedStage(Shader::HwStage stage_in, Shader::SwStage stage_out,
+                          const ProgramRegs& pgm, Shader::Backend::Bindings& binding);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
@@ -113,10 +221,27 @@ private:
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+    /// The part of the runtime info that only depends on the registers (any thread). Returns
+    /// false for the stages that read more (tessellation).
+    bool BuildRuntimeInfoFrom(Shader::RuntimeInfo& info, const AmdGpu::Regs& regs,
+                              Shader::HwStage stage, Shader::SwStage l_stage,
+                              const std::array<Shader::PsColorBuffer, Shader::MaxColorBuffers>&
+                                  color_buffers,
+                              const DrawIndirectParams& indirect_params) const;
+    /// The color targets of the graphics key, from the registers.
+    static void FillColorBuffers(
+        const AmdGpu::Regs& regs,
+        std::array<Shader::PsColorBuffer, Shader::MaxColorBuffers>& color_buffers);
+    /// The program of a shader, null when not compiled yet (any thread).
+    Program* FindProgram(u64 hash);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
+
+    /// Hands a pipeline created with a deferred compilation to the worker threads, then waits
+    /// for it at most async_pipeline_wait_ms. Callers skip their work while it is not ready.
+    void CompileAsync(Pipeline* pipeline);
 
 private:
     const Instance& instance;
@@ -129,10 +254,35 @@ private:
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    /// Held exclusively while the command processor adds a program, shared by the scout
+    /// thread while it looks one up (the command processor reads without it: it is the only
+    /// writer).
+    std::shared_mutex program_cache_mutex;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    /// Shader params memo (shader_params_memo): the code size and hash found for a shader
+    /// address, reused while the upload epoch and the emulator write generation stay the same.
+    /// Until then there was no new submission or guest wait, so the guest cannot have written
+    /// other code at that address for the commands being processed. Reading the code start and
+    /// its binary info at the end of the code missed the caches twice per stage of every draw.
+    struct ParamsMemo {
+        VAddr address{};
+        u64 epoch{};
+        u64 host_write_gen{};
+        u64 hash{};
+        u32 num_dwords{};
+    };
+    static constexpr u32 NumParamsMemoBits = 6;
+    std::array<ParamsMemo, 1U << NumParamsMemoBits> params_memos{};
+    /// Pipeline key memo (pipeline_key_memo): the key and pipeline of the last draw.
+    GraphicsPipelineKey last_graphics_key{};
+    GraphicsPipeline* last_graphics_pipeline{};
+    std::unordered_set<u64> xray_dumped; ///< Shaders whose code the frame x-ray wrote.
     std::array<const Shader::Info*, MaxShaderStages> infos{};
+    /// The stages of the current draw taken from the scout (TakeScoutedStage), by stage.
+    std::array<const Shader::Info*, MaxShaderStages> taken_scout_infos{};
+    std::array<const AmdGpu::ScoutStage*, MaxShaderStages> taken_scout_stages{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     Shader::Gcn::FetchShaderData* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
@@ -143,6 +293,8 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    std::unique_ptr<PipelineCompiler> compiler;
 };
 
 } // namespace Vulkan

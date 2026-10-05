@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/types.h"
@@ -83,8 +85,9 @@ private:
     Scheduler& scheduler;
 
     std::array<Ring, NUM_TYPES> rings;
+    mutable std::mutex large_mutex;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
-    u64 frame = 0;
+    std::atomic<u64> frame{0};
 };
 
 } // namespace Vulkan
