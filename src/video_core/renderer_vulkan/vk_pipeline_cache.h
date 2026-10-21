@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
 #include <shared_mutex>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -16,6 +17,8 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/preload_identity.h"
+#include "video_core/renderer_vulkan/last_stage_lookup.h"
 #include "vulkan/vulkan.hpp"
 
 template <>
@@ -75,6 +78,7 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    LastStageLookup last_stage_lookup;
 
     /// Permutation memo (Tuning::spec_memo): hash of the resource descriptors, runtime info and
     /// start bindings of recent bindings of this program, and the permutation they selected.
@@ -164,7 +168,14 @@ public:
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage, u64 expected_hash);
+    PreloadIdentity preload_identity;
+    std::unordered_map<u64, std::pair<Program*, size_t>> preload_stages;
+    u64 preload_stage_hits{};
+    bool LoadCachedPipelineStage(u64 hash, size_t stage);
+    bool parallel_preload{};
+    void QueuePreload(Pipeline* pipeline);
+    void WaitPreload();
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -244,11 +255,14 @@ private:
     void CompileAsync(Pipeline* pipeline);
 
 private:
+    void SaveDriverCache();
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
+    std::filesystem::path driver_cache_path;
+    bool driver_cache_saved{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

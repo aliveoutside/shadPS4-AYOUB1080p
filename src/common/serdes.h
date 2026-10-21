@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace Serialization {
 
@@ -59,7 +60,7 @@ struct Archive {
     }
 
     Archive() = default;
-    explicit Archive(std::vector<u8>&& v) : container{v} {}
+    explicit Archive(std::vector<u8>&& v) : container{std::move(v)} {}
 
 private:
     u32 offset{};

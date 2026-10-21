@@ -172,7 +172,8 @@ public:
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                             bool is_texel_buffer = false,
+                                                             bool* known_unwritten = nullptr);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -441,6 +442,15 @@ private:
     };
     static constexpr size_t NumSyncMemos = 4096;
     std::array<SyncMemo, NumSyncMemos> sync_memos{};
+    struct LargeReadMemo {
+        const Buffer* arena{};
+        VAddr address{};
+        u64 size{}, epoch{}, host_write_gen{};
+        u32 queue{};
+        bool valid{};
+        std::vector<u64> versions;
+    };
+    std::array<LargeReadMemo, 16> large_read_memos;
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;

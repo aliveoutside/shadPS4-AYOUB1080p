@@ -8,6 +8,7 @@
 #include "common/types.h"
 
 #include <functional>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,7 @@ public:
 
     void Open();
     void Close();
+    void SetBeforeClose(std::function<void()> callback) { before_close = std::move(callback); }
     /// Moves the current (incompatible) cache aside and reopens an empty one.
     void Reset();
     [[nodiscard]] bool IsOpened() const {
@@ -46,7 +48,8 @@ public:
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
-    bool opened{};
+    std::atomic<bool> opened{};
+    std::function<void()> before_close;
 };
 
 } // namespace Storage

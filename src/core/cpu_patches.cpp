@@ -25,6 +25,7 @@
 #include "common/types.h"
 #include "core/signals.h"
 #include "core/tls.h"
+#include "core/tcb_load_pattern.h"
 #include "cpu_patches.h"
 
 #ifdef _WIN32
@@ -902,6 +903,13 @@ static bool TryPatchJit(void* code_address) {
     if (std::ranges::find(module->patched, code) != module->patched.end()) {
         return true;
     }
+#ifdef _WIN32
+    if (IsAbsoluteTcbAccess(std::span<const u8>{code, static_cast<size_t>(module->end - code)},
+                          sizeof(Tcb))) {
+        LOG_WARNING(Core, "TLS load reached runtime patching at {} (module offset {:#x})",
+                    fmt::ptr(code), code - module->start);
+    }
+#endif
 
     return TryPatch(code, module).first;
 }
@@ -2195,6 +2203,42 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 }
 
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
+#ifdef _WIN32
+    // A live near-jump replacement is written byte-by-byte by Xbyak. Another
+    // guest thread can observe E9 with the original TLS instruction's 0x25 SIB
+    // byte still in the high displacement byte. Prepare these common TLS loads
+    // while the module is being loaded, before its code is exposed to the guest.
+    // The separate static red-zone pass already handles CPU patches itself.
+    if (!WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
+        auto* code = reinterpret_cast<u8*>(segment_addr);
+        auto* module = GetContainingModule(code);
+        if (module) {
+            std::unique_lock lock{module->mutex};
+            const u64 size = std::min<u64>(segment_size, module->end - code);
+            u64 patched = 0;
+            for (u64 i = 0; i + 9 <= size;) {
+                if (IsAbsoluteTcbAccess(std::span<const u8>{code + i, size - i}, sizeof(Tcb))) {
+                    ZydisDecodedInstruction instruction;
+                    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                    const auto status = Common::Decoder::Instance()->decodeInstruction(
+                        instruction, operands, code + i, size - i);
+                    if (ZYAN_SUCCESS(status) && instruction.length == 9 &&
+                        Patches.contains(instruction.mnemonic) && FilterTcbAccess(operands)) {
+                        const auto [done, length] = TryPatch(code + i, module);
+                        if (done) { ++patched; i += length; continue; }
+                    }
+                }
+                ++i;
+            }
+            if (patched) {
+                FlushInstructionCache(GetCurrentProcess(), code, size);
+                FlushInstructionCache(GetCurrentProcess(), module->trampoline_gen.getCode(),
+                                      module->trampoline_gen.getSize());
+                LOG_INFO(Core, "Prepared {} TLS accesses before guest execution", patched);
+            }
+        }
+    }
+#endif
 #if !defined(_WIN32) && !defined(__APPLE__)
     // Linux and others have an FS segment pointing to valid memory, so continue to do full
     // ahead-of-time patching for now until a better solution is worked out.

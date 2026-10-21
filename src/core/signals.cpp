@@ -158,6 +158,20 @@ static void LogExceptionSnapshot(const char* label, const WindowsExceptionSnapsh
     for (SIZE_T i = 0; i < stack_size / sizeof(u64) && i < stack.size(); ++i) {
         LOG_CRITICAL(Debug, "CrashDiag v1 {}: [rsp+{:#x}]={:#x}", label, i * sizeof(u64), stack[i]);
     }
+    // Guest code has no Windows unwind metadata. Record bounded frame-pointer
+    // candidates separately; these are not a validated call stack.
+    u64 frame = snapshot.rbp;
+    for (u32 i = 0; i < 12 && frame >= snapshot.rsp &&
+                        frame - snapshot.rsp <= 1024 * 1024; ++i) {
+        std::array<u64, 2> pair{};
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(frame), pair.data(),
+                               sizeof(pair), &read) || read != sizeof(pair)) break;
+        LOG_CRITICAL(Debug, "CrashDiag frame candidate {}: fp={:#x} next={:#x} return={:#x}",
+                     i, frame, pair[0], pair[1]);
+        if (pair[0] <= frame) break;
+        frame = pair[0];
+    }
 }
 
 // CrashDiag v2: call stack with module offsets, and the type, message and origin of C++

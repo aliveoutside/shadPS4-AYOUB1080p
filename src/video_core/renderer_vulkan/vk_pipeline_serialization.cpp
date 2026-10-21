@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/serdes.h"
+#include "common/hash.h"
+#include "common/scope_exit.h"
+#include "common/perf_stats.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -153,22 +156,38 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+bool PipelineCache::LoadCachedPipelineStage(u64 hash, size_t stage) {
+    if (const auto it = preload_stages.find(hash); it != preload_stages.end()) {
+        const auto [program, index] = it->second;
+        infos[stage] = &program->info;
+        modules[stage] = program->modules[index].module;
+        if (auto& fetch = program->modules[index].spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        ++preload_stage_hits;
+        return true;
+    }
+    // Storage is read-only during WarmUp. Repeated keys resolve to the same
+    // validated metadata/SPIR-V; retain an index, not a vector element pointer.
+    std::vector<u8> meta_blob;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                      fmt::format("{:#018x}", hash), meta_blob);
+    if (meta_blob.empty()) return false;
+    Serialization::Archive meta_ar{std::move(meta_blob)};
+    return LoadPipelineStage(meta_ar, stage, hash);
+}
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+    SCOPE_EXIT { infos.fill(nullptr); modules.fill(nullptr); fetch_shader = nullptr; };
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
-    std::vector<u8> meta_blob;
-    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
-                                       fmt::format("{:#018x}", compute_key.value), meta_blob);
-    if (meta_blob.empty()) {
-        return false;
-    }
-
-    Serialization::Archive meta_ar{std::move(meta_blob)};
-
-    if (!LoadPipelineStage(meta_ar, 0)) {
+    if (!LoadCachedPipelineStage(compute_key.value, 0)) {
         return false;
     }
 
@@ -177,7 +196,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+                                          compute_key, *infos[0], modules[0], sdata, true,
+                                          parallel_preload);
+    if (parallel_preload) QueuePreload(it.value().get());
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -222,6 +243,10 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+    SCOPE_EXIT { infos.fill(nullptr); modules.fill(nullptr); fetch_shader = nullptr; };
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -233,16 +258,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
             continue;
         }
 
-        std::vector<u8> meta_blob;
-        Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
-                                           fmt::format("{:#018x}", hash), meta_blob);
-        if (meta_blob.empty()) {
-            return false;
-        }
-
-        Serialization::Archive meta_ar{std::move(meta_blob)};
-
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        if (!LoadCachedPipelineStage(hash, stage_idx)) {
             return false;
         }
     }
@@ -252,7 +268,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+        runtime_infos, fetch_shader, modules, sdata, true, parallel_preload);
+    if (parallel_preload) QueuePreload(it.value().get());
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -261,12 +278,18 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, u64 expected_hash) {
+    std::vector<u8> metadata(ar.CurrPtr(), ar.CurrPtr() + ar.SizeBytes());
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
     if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
+        return false;
+    }
+    if (HashCombine(program->info.pgm_hash, u64{perm_idx}) != expected_hash) {
+        LOG_WARNING(Render_Vulkan, "Cached shader metadata does not match pipeline key {:#x}",
+                    expected_hash);
         return false;
     }
 
@@ -290,25 +313,24 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // A matching permutation is valid only at its original index. A different index means
-            // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            if (perm_idx != idx) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                            "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+        const auto& saved = it_pgm.value()->modules;
+        if (perm_idx < saved.size() && saved[perm_idx].module) {
+            if (!preload_identity.Matches(expected_hash, metadata)) {
+                LOG_WARNING(Render_Vulkan, "Conflicting metadata at cached shader key {:#x}",
+                            expected_hash);
                 return false;
             }
-            module = it->module;
+            module = saved[perm_idx].module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    // The temporary Program above is destroyed for an existing shader. The
+    // specialization must point to the Program that actually owns this slot.
+    spec.info = &it_pgm.value()->info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    preload_identity.Remember(expected_hash, std::move(metadata));
+    preload_stages.emplace(expected_hash, std::pair{it_pgm.value().get(), perm_idx});
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
@@ -320,6 +342,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
+    preload_identity.Clear();
+    preload_stages.clear();
+    preload_stage_hits = 0;
+    SCOPE_EXIT { preload_identity.Clear(); preload_stages.clear(); };
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }
@@ -366,10 +392,20 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    const u64 preload_start = Common::Perf::NowNs();
+    u64 last_progress = preload_start;
+    LOG_INFO(Render, "Pipeline preload started; parallel={}", parallel_preload);
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            const u64 now = Common::Perf::NowNs();
+            if (now - last_progress >= 1'000'000'000ULL) {
+                LOG_INFO(Render, "Pipeline preload: {} entries, {} accepted, {} reused stages, {:.1f} s",
+                         num_total_pipelines, num_pipelines, preload_stage_hits,
+                         double(now - preload_start) / 1e9);
+                last_progress = now;
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -395,7 +431,13 @@ void PipelineCache::WarmUp() {
             }
         });
 
+    if (parallel_preload) {
+        LOG_INFO(Render, "Pipeline preload: finishing compiler work before starting the game");
+        WaitPreload();
+    }
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render, "Pipeline preload finished in {:.2f} s; {} repeated stage loads avoided",
+             double(Common::Perf::NowNs() - preload_start) / 1e9, preload_stage_hits);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

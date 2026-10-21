@@ -123,7 +123,13 @@ void PollTuning() {
         if (value.empty()) {
             continue;
         }
-        if (key == "readback_window_kb") {
+        if (key == "reuse_buffer_checks") {
+            tuning.reuse_buffer_checks.store(value != "0", std::memory_order_relaxed);
+            LOG_INFO(Debug, "Perf tuning reuse_buffer_checks={}", value != "0");
+        } else if (key == "large_read_memo") {
+            tuning.large_read_memo.store(value != "0", std::memory_order_relaxed);
+            LOG_INFO(Debug, "Perf tuning large_read_memo={}", value != "0");
+        } else if (key == "readback_window_kb") {
             const u64 kilobytes =
                 std::clamp<u64>(std::strtoull(value.c_str(), nullptr, 10), 64, 256 * 1024);
             tuning.readback_window_bytes.store(std::bit_floor(kilobytes) * 1024,
@@ -240,6 +246,8 @@ void PollTuning() {
             tuning.async_readbacks.store(value != "0", std::memory_order_relaxed);
         } else if (key == "readback_prefetch") {
             tuning.readback_prefetch.store(value != "0", std::memory_order_relaxed);
+        } else if (key == "tiered_compute_pipelines") {
+            tuning.tiered_compute_pipelines.store(value != "0", std::memory_order_relaxed);
         } else if (key == "async_pipelines") {
             tuning.async_pipelines.store(std::min<u32>(std::strtoul(value.c_str(), nullptr, 10), 2),
                                          std::memory_order_relaxed);
@@ -824,13 +832,17 @@ public:
 
     void Run(const std::stop_token& stop) {
         Common::SetCurrentThreadName("shadPS4:PerfSampler");
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        const char* sample_setting = std::getenv("SHADPS4_CPU_SAMPLING");
+        const bool sample_cpu = sample_setting == nullptr || sample_setting[0] != '0';
+        SetThreadPriority(GetCurrentThread(), sample_cpu ? THREAD_PRIORITY_HIGHEST
+                                                        : THREAD_PRIORITY_NORMAL);
         HANDLE timer = CreateWaitableTimerExW(
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         const auto reports = [] {
             return Common::Perf::GetTuning().perf_log.load(std::memory_order_relaxed);
         };
         if (reports()) {
+            LOG_INFO(Debug, "Instruction sampling (thread suspension): {}", sample_cpu);
             LOG_INFO(Debug,
                      "Perf sampler started: thread CPU usage every second, profile of threads "
                      "above {:.0f}% CPU every {} s (high resolution timer: {})",
@@ -846,7 +858,7 @@ public:
         while (!stop.stop_requested()) {
             // Without reports, only the thread affinities and priorities are kept up to date.
             const bool reporting = reports();
-            if (reporting) {
+            if (reporting && sample_cpu) {
                 WaitOneMillisecond(timer);
                 SampleTargets();
             } else {
@@ -1417,7 +1429,7 @@ private:
     }
 
     /// Groups an address by function for host code (unwind data), by 256 bytes for guest code.
-    std::string Describe(u64 address) {
+    std::string Describe(u64 address, bool exact_guest = false) {
         HMODULE module{};
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1433,7 +1445,8 @@ private:
             auto* linker = Common::Singleton<Core::Linker>::Instance();
             if (const auto* guest_module = linker->FindByAddress(address)) {
                 return fmt::format("guest {}+{:#x}", guest_module->name,
-                                   (address - guest_module->GetBaseAddress()) & ~0xFFULL);
+                                   (address - guest_module->GetBaseAddress()) &
+                                       (exact_guest ? ~0ULL : ~0xFFULL));
             }
             return fmt::format("guest {:#x}", address & ~0xFFFULL);
         }
@@ -1617,6 +1630,8 @@ private:
                 const auto& [count, site] = sites[i];
                 LOG_INFO(Debug, "Perf readback site {:5} x  page {:#x}  read by {}", count,
                          site.page << 12, Describe(site.rip));
+                LOG_INFO(Debug, "Perf readback exact {:5} x  page {:#x}  rip {:#x}  {}", count,
+                         site.page << 12, site.rip, Describe(site.rip, true));
             }
             // The same by reading code only (all pages), busiest first.
             std::unordered_map<std::string, std::pair<u64, u64>> by_code;

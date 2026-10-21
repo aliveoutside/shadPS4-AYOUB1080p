@@ -6,6 +6,7 @@
 #include <span>
 #include <unordered_map>
 
+#include "video_core/renderer_vulkan/image_format_cache.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -32,6 +33,9 @@ public:
     /// Gets a compatibility format if the format is not supported.
     [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
                                                 vk::FormatFeatureFlags2 flags) const;
+
+    [[nodiscard]] ImageFormatCache::Result GetImageFormatProperties(
+        const vk::PhysicalDeviceImageFormatInfo2& info) const;
 
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
@@ -554,6 +558,7 @@ private:
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
+    ImageFormatCache image_format_cache;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
     bool custom_border_color{};

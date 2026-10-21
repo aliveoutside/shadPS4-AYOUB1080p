@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 
 #include "video_core/cache_storage.h"
+#include "video_core/cache_write_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
@@ -18,14 +19,11 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <utility>
 
 namespace {
 
-std::mutex submit_mutex{};
-u32 num_requests{};
-std::condition_variable_any request_cv{};
-std::queue<std::packaged_task<void()>> req_queue{};
-std::mutex m_request{};
+Storage::CacheWriteQueue write_queue;
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -37,34 +35,8 @@ namespace Storage {
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
-    while (!stoken.stop_requested()) {
-        {
-            std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
-            {
-                std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
-                }
-                request = std::move(req_queue.front());
-                req_queue.pop();
-            }
-
-            if (request.valid()) {
-                request();
-                request.get_future().wait();
-            }
-
-            --num_requests;
-        }
+    while (auto request = write_queue.Next(stoken)) {
+        if (request->valid()) (*request)();
     }
 }
 
@@ -116,6 +88,7 @@ void DataBase::Open() {
         }
     }
 
+    ASSERT_MSG(write_queue.Begin(), "Previous pipeline cache writes were not drained");
     io_worker = std::jthread{ProcessIO};
     opened = true;
 }
@@ -125,6 +98,10 @@ void DataBase::Close() {
         return;
     }
 
+    // Reject new work and complete every already accepted write before joining.
+    opened = false;
+    if (auto callback = std::exchange(before_close, {})) callback();
+    write_queue.Seal();
     io_worker.request_stop();
     io_worker.join();
 
@@ -164,30 +141,25 @@ void DataBase::Reset() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
+        auto request = std::packaged_task<void()>{[type, path = std::move(path_),
+                                                 data = std::move(v)]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
             if (EmulatorSettings.IsPipelineCacheArchived()) {
                 ASSERT_MSG(!ar_is_read_only,
                            "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), data.data(),
+                                           data.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
                 using namespace Common::FS;
                 const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                file.Write(data);
             }
         }};
-        std::scoped_lock lock{m_request};
-        req_queue.emplace(std::move(request));
+        return write_queue.Submit(std::move(request));
     }
 
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
-    request_cv.notify_one();
-    return true;
 }
 
 template <typename T>

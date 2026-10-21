@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -119,7 +120,16 @@ void GameController::UpdateAcceleration(const float acceleration[3]) {
 
 void GameController::PollState() {
     std::lock_guard lock{m_state_mutex};
-    PushStateLocked();
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    if (m_swipe_direction) {
+        const float progress = float(timestamp - m_swipe_start) / 450'000.0f;
+        m_state.OnSwipeTouchpad(*m_swipe_direction, progress);
+        if (progress >= 1.0f) {
+            m_swipe_direction.reset();
+            m_touch_down_timestamp = 0;
+        }
+    }
+    PushStateLocked(timestamp);
 }
 
 void GameController::ResetOrientation() {
@@ -136,6 +146,7 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
 
     std::lock_guard lock{m_state_mutex};
     const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    m_swipe_direction.reset();
     const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
     auto& touch = m_state.touchpad[touch_index];
     if (touch_down && !touch.state) {
@@ -149,6 +160,46 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
     } else if (was_pressed && !is_pressed) {
         m_touch_down_timestamp = 0;
     }
+    PushStateLocked(timestamp);
+}
+
+void GameController::SetTouchpadButtonState(int index, bool down, float x) {
+    if (index < 0 || index >= 2) return;
+    std::lock_guard lock{m_state_mutex};
+    m_swipe_direction.reset();
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
+    m_state.OnTouchpadButton(index, down, x, m_next_touch_id);
+    const bool pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
+    if (!was_pressed && pressed) m_touch_down_timestamp = timestamp;
+    else if (!pressed) m_touch_down_timestamp = 0;
+    PushStateLocked(timestamp);
+}
+
+void GameController::SetTwoFingerTouchpadState(bool down) {
+    std::lock_guard lock{m_state_mutex};
+    m_swipe_direction.reset();
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
+    m_state.OnTwoFingerTouchpad(down, m_next_touch_id);
+    if (!was_pressed && down) {
+        m_touch_down_timestamp = timestamp;
+    } else if (!down) {
+        m_touch_down_timestamp = 0;
+    }
+    PushStateLocked(timestamp);
+}
+
+void GameController::StartTouchpadSwipe(int direction) {
+    if (direction < 0 || direction > 3) return;
+    std::lock_guard lock{m_state_mutex};
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    m_swipe_direction = direction;
+    m_swipe_start = timestamp;
+    m_state.touchpad[0].ID = m_next_touch_id;
+    m_next_touch_id = m_next_touch_id == 127 ? 1 : m_next_touch_id + 1;
+    m_touch_down_timestamp = timestamp;
+    m_state.OnSwipeTouchpad(direction, 0.0f);
     PushStateLocked(timestamp);
 }
 
@@ -183,6 +234,7 @@ void GameController::DisconnectController() {
     accel_buf[1] = 9.81f;
     m_next_touch_id = 1;
     m_touch_down_timestamp = 0;
+    m_swipe_direction.reset();
     m_state.connected = false;
     m_last_orientation_update = 0;
     PushStateLocked();
@@ -213,6 +265,20 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
     m_states_queue.Push(m_state);
+    static const bool trace = [] {
+        const char* value = std::getenv("SHADPS4_TRACE_TOUCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    const u64 trace_interval = m_state.touchpad[0].state || m_state.touchpad[1].state ? 100'000 : 500'000;
+    if (trace && timestamp - m_last_touch_trace >= trace_interval) {
+        m_last_touch_trace = timestamp;
+        LOG_INFO(Input,
+                 "Touch report user={} contacts={} click={} id0={} xy0={},{} id1={} xy1={},{}",
+                 user_id, int(m_state.touchpad[0].state) + int(m_state.touchpad[1].state),
+                 bool(m_state.buttonsState & OrbisPadButtonDataOffset::TouchPad),
+                 m_state.touchpad[0].ID, m_state.touchpad[0].x, m_state.touchpad[0].y,
+                 m_state.touchpad[1].ID, m_state.touchpad[1].x, m_state.touchpad[1].y);
+    }
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {
@@ -273,6 +339,17 @@ void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
     int controller_count;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
+    // Opt-in at startup: the virtual Sony pad carries PhonePad's touch/motion and also
+    // the physical Xbox buttons. Reserve player 1 for it when both are already present.
+    if (const char* value = std::getenv("SHADPS4_PREFER_TOUCHPAD");
+        value != nullptr && value[0] == '1' && controller_count > 1) {
+        const auto preferred = [](SDL_JoystickID id) {
+            const auto type = SDL_GetGamepadTypeForID(id);
+            return type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5;
+        };
+        std::stable_sort(new_joysticks, new_joysticks + controller_count,
+                         [&](auto a, auto b) { return preferred(a) > preferred(b); });
+    }
     LOG_INFO(Input, "{} controllers are currently connected", controller_count);
 
     std::unordered_set<SDL_JoystickID> assigned_ids;
@@ -321,10 +398,17 @@ void GameControllers::TryOpenSDLControllers() {
                 auto* c = controllers[i];
                 LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}", i,
                          SDL_GetGamepadID(pad));
+                LOG_INFO(Input, "Gamepad slot {} name={} touchpads={} fingers={}", i,
+                         SDL_GetGamepadName(pad), SDL_GetNumGamepadTouchpads(pad),
+                         SDL_GetNumGamepadTouchpads(pad) > 0
+                             ? SDL_GetNumGamepadTouchpadFingers(pad, 0) : 0);
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
+                if (GetTouchpadTargetFromJoystickId(id) != i) {
+                    LOG_INFO(Input, "Touch/motion bridge: source slot {} supplements player 1", i);
+                }
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
@@ -368,6 +452,23 @@ u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     }
     // LOG_TRACE(Input, "Gamepad index: {}", index);
     return -1;
+}
+
+u8 GameControllers::GetTouchpadTargetFromJoystickId(SDL_JoystickID id) {
+    const auto* source_pad = SDL_GetGamepadFromID(id);
+    if (!source_pad) return 255;
+    const u8 index = GetGamepadIndexFromJoystickId(id);
+    if (index >= 5) return index;
+    static const bool bridge = [] {
+        const char* value = std::getenv("SHADPS4_PREFER_TOUCHPAD");
+        return value != nullptr && value[0] == '1';
+    }();
+    // Preserve player-1 buttons/axes on the Xbox. Supplement only touch/motion/click
+    // from the virtual pad, including when it connects after the game has started.
+    const bool source_has_touch = SDL_GetNumGamepadTouchpads(controllers[index]->m_sdl_gamepad) > 0;
+    const bool primary_has_touch = controllers[0]->m_sdl_gamepad &&
+                                  SDL_GetNumGamepadTouchpads(controllers[0]->m_sdl_gamepad) > 0;
+    return SelectTouchpadTarget(index, bridge, source_has_touch, primary_has_touch);
 }
 
 std::optional<u8> GameControllers::GetControllerIndexFromUserID(s32 user_id) {

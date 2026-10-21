@@ -410,9 +410,11 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     // the touchpad button shouldn't be rebound to anything else,
     // as it would break the entire touchpad handling
     // You can still bind other things to it though
-    if (event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-        controllers[controllers.GetGamepadIndexFromJoystickId(event->gbutton.which)]->Button(
-            OrbisPadButtonDataOffset::TouchPad, input_down);
+    if ((event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+         event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+        event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+        const u8 target = controllers.GetTouchpadTargetFromJoystickId(event->gbutton.which);
+        if (target < 5) controllers[target]->Button(OrbisPadButtonDataOffset::TouchPad, input_down);
         return;
     }
 
@@ -422,13 +424,13 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
         switch ((SDL_SensorType)event->gsensor.sensor) {
         case SDL_SENSOR_GYRO:
-            gamepad = controllers.GetGamepadIndexFromJoystickId(event->gsensor.which);
+            gamepad = controllers.GetTouchpadTargetFromJoystickId(event->gsensor.which);
             if (gamepad < 5) {
                 controllers[gamepad]->UpdateGyro(event->gsensor.data);
             }
             break;
         case SDL_SENSOR_ACCEL:
-            gamepad = controllers.GetGamepadIndexFromJoystickId(event->gsensor.which);
+            gamepad = controllers.GetTouchpadTargetFromJoystickId(event->gsensor.which);
             if (gamepad < 5) {
                 controllers[gamepad]->UpdateAcceleration(event->gsensor.data);
             }
@@ -440,10 +442,12 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-        controllers[controllers.GetGamepadIndexFromJoystickId(event->gtouchpad.which)]
-            ->SetTouchpadState(event->gtouchpad.finger,
+        gamepad = controllers.GetTouchpadTargetFromJoystickId(event->gtouchpad.which);
+        if (gamepad < 5) {
+            controllers[gamepad]->SetTouchpadState(event->gtouchpad.finger,
                                event->type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP, event->gtouchpad.x,
                                event->gtouchpad.y);
+        }
         return;
     default:
         break;

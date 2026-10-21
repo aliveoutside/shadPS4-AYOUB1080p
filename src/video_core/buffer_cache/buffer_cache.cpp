@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <magic_enum/magic_enum.hpp>
 
@@ -22,6 +23,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
+#include "video_core/buffer_cache/upload_parts.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1417,7 +1419,9 @@ void BufferCache::PrefetchStreamSource(VAddr device_addr, u64 size) noexcept {
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer) {
+                                                        bool is_written, bool is_texel_buffer,
+                                                        bool* known_unwritten) {
+    if (known_unwritten) *known_unwritten = false;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !HasGpuData(device_addr, size)) {
         const auto& tuning = Common::Perf::GetTuning();
@@ -1438,6 +1442,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 reuse->epoch == epoch && reuse->host_write_gen == host_write_gen) {
                 Common::Perf::Add(Common::Perf::StreamReuses);
                 Common::Perf::Add(Common::Perf::StreamReuseBytes, size);
+                if (known_unwritten) *known_unwritten = true;
                 return {&Stream(), reuse->offset};
             }
         }
@@ -1456,6 +1461,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     Common::Perf::Add(Common::Perf::StreamArenaBinds);
                     EnsureResident(arena, first_block, last_block);
                     NoteQueueAccess(device_addr, size, false);
+                    if (known_unwritten) *known_unwritten = true;
                     return {arena, arena_offset};
                 }
                 Common::Perf::Add(Common::Perf::StreamBarrierAvoided);
@@ -1483,6 +1489,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 .queue = active->index,
             };
         }
+        if (known_unwritten) *known_unwritten = true;
         return {&stream, offset};
     }
     if (const u32 probe = Common::Perf::GetTuning().probe_host_import.load(
@@ -1518,9 +1525,48 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_texel_buffer && !is_written && !OnComputeQueue()) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
+    const bool large_read_memo_enabled = tuning.large_read_memo.load(std::memory_order_relaxed);
+    LargeReadMemo* large = nullptr;
+    u64 epoch = 0;
+    u64 host_gen = 0;
+    bool large_hit = false;
+    bool have_large_versions = false;
+    if (large_read_memo_enabled && !is_written && size >= 64_MB &&
+        tuning.hot_page_faults.load(std::memory_order_relaxed) == 0 &&
+        !tuning.readback_write_merge.load(std::memory_order_relaxed)) {
+        epoch = CurrentUploadEpoch();
+        host_gen = CurrentHostWriteGen();
+        Common::Perf::Add(Common::Perf::LargeReadMemoChecks);
+        const u64 key = (device_addr >> 12) ^ (u64{size} * 0x9E3779B97F4A7C15ULL);
+        large = &large_read_memos[(key * 0x9E3779B97F4A7C15ULL) >> 60];
+        large_hit = large->valid && large->arena == arena && large->address == device_addr &&
+                    large->size == size && large->epoch == epoch && large->host_write_gen == host_gen &&
+                    large->queue == active->index &&
+                    memory_tracker->CheckLargeCpuVersions(device_addr, size, large->versions, true);
+        if (!large_hit) {
+            large->valid = false;
+            have_large_versions = memory_tracker->CheckLargeCpuVersions(device_addr, size,
+                                                                         large->versions, false);
+        }
+    }
+    if (large_hit) {
+        Common::Perf::Add(Common::Perf::LargeReadMemoHits);
+        // GPU writes to an aliased image remain visible even if the CPU copy
+        // has not changed. Only the CPU dirty-page scan/upload is bypassed.
+        if (is_texel_buffer && !OnComputeQueue()) {
+            SynchronizeMemoryFromImage(arena, device_addr, size);
+        }
+    } else {
+        SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+        if (large && have_large_versions) {
+            large->arena = arena;
+            large->address = device_addr;
+            large->size = size;
+            large->epoch = epoch;
+            large->host_write_gen = host_gen;
+            large->queue = active->index;
+            large->valid = true;
+        }
     }
     // Cross queue dependencies before the write tick of this access is recorded.
     NoteQueueAccess(device_addr, size, is_written);
@@ -1893,7 +1939,37 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         // The guest wrote these bytes after the GPU: guest memory has their current value.
         gpu_modified_ranges.Subtract(lo, hi - lo);
     }
-    if (async_upload && (!copies.empty() || !deferred_pages.empty())) {
+    constexpr u64 MaxUploadPartBytes = 256_MB;
+    if (total_size_bytes > MaxUploadPartBytes && !hash_hot_pages && !merge) {
+        Common::Perf::ScopedTimer upload_timer{Common::Perf::BufferUploads,
+                                               Common::Perf::BufferUploadNs};
+        Common::Perf::Add(Common::Perf::BufferUploadBytes, total_size_bytes);
+        // Deferred pages must be protected before the command processor reads
+        // them. Drain preceding worker jobs too before reusing staging memory.
+        if (async_upload) {
+            UploadWorker::Job protect;
+            protect.pages = std::move(deferred_pages);
+            upload_worker->Wait(upload_worker->Enqueue(std::move(protect)));
+        }
+        decltype(Staging().Request(MaxUploadPartBytes, MemoryType::HostUncached)) staging{};
+        boost::container::small_vector<vk::BufferCopy, 4> part_copies;
+        bool first = true;
+        ForEachUploadPart(copies, MaxUploadPartBytes, [&] {
+            if (!first) Sched().Finish();
+            first = false;
+            staging = Staging().Request(MaxUploadPartBytes, MemoryType::HostUncached);
+        }, [&](VAddr address, u64 offset, u64 bytes) {
+            memory->CopySparseMemory(address, staging.mapped + offset, bytes);
+            part_copies.emplace_back(staging.offset + offset, address - arena->cpu_addr, bytes);
+        }, [&](u64 bytes) {
+            staging.Flush();
+            Rt().CopyBuffer(staging.buffer, arena, part_copies);
+            NoteQueueUpload(device_addr, size);
+            part_copies.clear();
+        });
+        LOG_INFO(Render_Vulkan, "Large upload split: {} bytes in parts up to {} bytes",
+                 total_size_bytes, MaxUploadPartBytes);
+    } else if (async_upload && (!copies.empty() || !deferred_pages.empty())) {
         Common::Perf::ScopedTimer upload_timer{Common::Perf::BufferUploads,
                                                Common::Perf::BufferUploadNs};
         Common::Perf::Add(Common::Perf::BufferUploadBytes, total_size_bytes);

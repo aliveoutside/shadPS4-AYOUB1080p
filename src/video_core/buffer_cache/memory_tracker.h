@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "common/perf_stats.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/buffer_cache/version_snapshot.h"
 
 namespace VideoCore {
 
@@ -177,6 +179,20 @@ public:
             versions[1] = 0;
         }
         return true;
+    }
+
+    /// Conservative large-buffer memo: every region must exist, be tracked and
+    /// retain its CPU modification version. Hot pages cannot participate.
+    bool CheckLargeCpuVersions(VAddr address, u64 size, std::vector<u64>& versions, bool compare) {
+        if (size == 0 || address >= MAX_CPU_ADDRESS || size > MAX_CPU_ADDRESS - address) return false;
+        const u64 first = address >> HIGHER_PAGE_BITS;
+        const u64 last = (address + size - 1) >> HIGHER_PAGE_BITS;
+        return CheckVersionSnapshot(versions, last - first + 1, compare,
+            [&](size_t index) -> std::optional<u64> {
+                auto* region = top_tier[first + index];
+                if (!region || region->HasHotPages(0, HIGHER_PAGE_SIZE)) return std::nullopt;
+                return region->CpuVersion();
+            });
     }
 
     /// Write merge: whether some pages have a snapshot (cheap check before looking them up).

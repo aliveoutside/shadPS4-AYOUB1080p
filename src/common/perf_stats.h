@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "common/logging/log.h"
 #include "common/types.h"
@@ -141,6 +143,11 @@ enum Counter : u32 {
     // resource descriptors instead of specializing them again, and those specialized.
     SpecMemoHits,
     SpecMemoMisses,
+    StageLastMemoChecks,
+    StageLastMemoHits,
+    LargeReadMemoChecks,
+    LargeReadMemoHits,
+    BufferChecksReused,
     // Region summary: read only buffer bindings skipped without visiting any region (no region
     // of their range has CPU modified pages).
     RegionSummarySkips,
@@ -356,6 +363,8 @@ struct Tuning {
     std::atomic<u32> async_pipelines{2};
     /// How long the command processor waits for a new pipeline before skipping its work.
     std::atomic<u32> async_pipeline_wait_us{3000};
+    /// Complete compute work using a fast first pipeline, optimize a replacement in the background.
+    std::atomic<bool> tiered_compute_pipelines{false};
     /// Records a GPU checkpoint before each draw and dispatch, reported with the device fault
     /// information when the GPU crashes (device lost).
     std::atomic<bool> gpu_checkpoints{false};
@@ -455,6 +464,8 @@ struct Tuning {
     /// of their memory regions: bound again while no guest write touched those regions, they
     /// skip the page tracking checks.
     std::atomic<bool> sync_memo{false};
+    std::atomic<bool> large_read_memo{false};
+    std::atomic<bool> reuse_buffer_checks{false};
     /// Shader stages bound again with the same resource descriptors (hash) reuse their last
     /// permutation instead of specializing again.
     std::atomic<bool> spec_memo{false};
@@ -619,7 +630,138 @@ constexpr double SlowFrameMs = 50.0;
 constexpr u32 MaxSlowFramesPerSecond = 10;
 
 /// Called by the presenter for every presented guest frame. Not thread safe, single caller.
+struct FrameCsvField {
+    const char* name;
+    Counter counter;
+    bool nanoseconds;
+};
+inline constexpr FrameCsvField FrameCsvDetails[] = {
+    {"readback_queue_ms", ReadbackQueueNs, true},
+    {"readback_sync_ms", ReadbackSyncNs, true},
+    {"readback_async_wait_ms", ReadbackAsyncWaitNs, true},
+    {"readback_bytes", ReadbackBytes, false},
+    {"readback_reads", ReadbackReads, false},
+    {"readback_retries", ReadbackAsyncRetries, false},
+    {"readback_prefetch_hits", ReadbackPrefetchHits, false},
+    {"readback_queue_fallbacks", ReadbackQueueFallbacks, false},
+    {"recorder_work_ms", RecorderBusyNs, true},
+    {"recorder_sync_ms", RecorderSyncNs, true},
+    {"recorder_jobs", RecorderJobs, false},
+    {"recorder_commands", RecorderCommands, false},
+    {"recorder_wakes", RecorderWakes, false},
+    {"upload_worker_work_ms", AsyncUploadBusyNs, true},
+    {"upload_worker_wait_ms", AsyncUploadWaitNs, true},
+    {"upload_worker_bytes", AsyncUploadBytes, false},
+    {"protect_calls", ProtectCalls, false},
+    {"image_barrier_calls", BarrierCalls, false},
+    {"image_barriers_emitted", BarriersEmitted, false},
+    {"buffer_barrier_flushes", BufferBarrierFlushes, false},
+    {"stage_lookups", SpecCalls, false},
+    {"specialization_memo_hits", SpecMemoHits, false},
+    {"specialization_memo_misses", SpecMemoMisses, false},
+    {"stage_last_memo_checks", StageLastMemoChecks, false},
+    {"stage_last_memo_hits", StageLastMemoHits, false},
+    {"large_read_memo_checks", LargeReadMemoChecks, false},
+    {"large_read_memo_hits", LargeReadMemoHits, false},
+    {"buffer_checks_reused", BufferChecksReused, false},
+    {"texture_memo_hits", TexMemoHits, false},
+    {"texture_memo_misses", TexMemoMisses, false},
+    {"gpu_lag_wait_ms", GpuLagWaitNs, true},
+    // GPU results are counted when polled, which may be later than execution.
+    {"gpu_completed_work_ms", GpuProfileBusyNs, true},
+    {"gpu_completed_submissions", GpuProfileSessions, false},
+    {"gpu_completed_readback_ms", GpuProfileReadbackNs, true},
+};
+
+inline void CaptureFrameCsv(float draws_per_frame, float dispatches_per_frame) {
+    struct Capture {
+        std::FILE* file{};
+        u64 last{};
+        u64 index{};
+        std::array<u64, 18> previous{};
+        std::array<u64, std::size(FrameCsvDetails)> detail_previous{};
+        u64 last_flush{};
+        Capture() {
+            if (const char* path = std::getenv("SHADPS4_FRAME_CSV"); path && *path) {
+                file = std::fopen(path, "wb");
+                if (file) {
+                    std::setvbuf(file, nullptr, _IOFBF, 256 * 1024);
+                    std::fputs("frame,present_ms,draws,dispatches,shader_compile_ms,pipeline_stall_"
+                               "ms,gpu_wait_ms,readback_stall_ms,new_images,pipeline_skips,buffer_upload_ms,image_refresh_ms,page_protect_ms,pipeline_compile_ms,shader_compiles,pipelines_created,buffer_upload_bytes,image_upload_bytes,fault_reads,fault_writes,command_processor_ms,command_spin_ms",
+                               file);
+                    for (const auto& field : FrameCsvDetails) {
+                        std::fprintf(file, ",%s", field.name);
+                    }
+                    std::fputs(",gpu_profile_enabled\n", file);
+                }
+            }
+        }
+        ~Capture() {
+            if (file)
+                std::fclose(file);
+        }
+    };
+    static Capture capture;
+    if (!capture.file)
+        return;
+    const u64 now = NowNs();
+    const std::array<u64, 18> totals{Total(ShaderCompileNs), Total(PipelineStallNs),
+                                    Total(GpuWaitNs), Total(ReadbackStallNs), Total(ImageCreates),
+                                    Total(PipelineSkips), Total(BufferUploadNs), Total(ImageRefreshNs),
+                                    Total(ProtectNs), Total(PipelineCreateNs), Total(ShaderCompiles),
+                                    Total(PipelineCreates), Total(BufferUploadBytes), Total(ImageUploadBytes),
+                                    Total(FaultReads), Total(FaultWrites), Total(GpuBusyNs), Total(GpuSpinNs)};
+    if (capture.last != 0) {
+        std::fprintf(capture.file, "%llu,%.6f,%.1f,%.1f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f",
+                     static_cast<unsigned long long>(++capture.index),
+                     double(now - capture.last) / 1e6, draws_per_frame, dispatches_per_frame,
+                     double(totals[0] - capture.previous[0]) / 1e6,
+                     double(totals[1] - capture.previous[1]) / 1e6,
+                     double(totals[2] - capture.previous[2]) / 1e6,
+                     double(totals[3] - capture.previous[3]) / 1e6,
+                     static_cast<unsigned long long>(totals[4] - capture.previous[4]),
+                     static_cast<unsigned long long>(totals[5] - capture.previous[5]),
+                     double(totals[6] - capture.previous[6]) / 1e6,
+                     double(totals[7] - capture.previous[7]) / 1e6,
+                     double(totals[8] - capture.previous[8]) / 1e6,
+                     double(totals[9] - capture.previous[9]) / 1e6,
+                     static_cast<unsigned long long>(totals[10] - capture.previous[10]),
+                     static_cast<unsigned long long>(totals[11] - capture.previous[11]),
+                     static_cast<unsigned long long>(totals[12] - capture.previous[12]),
+                     static_cast<unsigned long long>(totals[13] - capture.previous[13]),
+                     static_cast<unsigned long long>(totals[14] - capture.previous[14]),
+                     static_cast<unsigned long long>(totals[15] - capture.previous[15]),
+                     double(totals[16] - capture.previous[16]) / 1e6,
+                     double(totals[17] - capture.previous[17]) / 1e6);
+    }
+    for (size_t i = 0; i < std::size(FrameCsvDetails); ++i) {
+        const auto& field = FrameCsvDetails[i];
+        const u64 total = Total(field.counter);
+        if (capture.last != 0) {
+            const u64 delta = total - capture.detail_previous[i];
+            if (field.nanoseconds) {
+                std::fprintf(capture.file, ",%.6f", double(delta) / 1e6);
+            } else {
+                std::fprintf(capture.file, ",%llu", static_cast<unsigned long long>(delta));
+            }
+        }
+        capture.detail_previous[i] = total;
+    }
+    if (capture.last != 0) {
+        std::fprintf(capture.file, ",%u\n",
+                     GetTuning().gpu_profile.load(std::memory_order_relaxed) != 0 ? 1u : 0u);
+    }
+    // Bounded live visibility without flushing for each frame.
+    if (now - capture.last_flush >= 1'000'000'000ULL) {
+        std::fflush(capture.file);
+        capture.last_flush = now;
+    }
+    capture.last = now;
+    capture.previous = totals;
+}
+
 inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
+    CaptureFrameCsv(draws_per_frame, dispatches_per_frame);
     if (!GetTuning().perf_log.load(std::memory_order_relaxed)) {
         return;
     }

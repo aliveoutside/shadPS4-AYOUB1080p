@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -829,6 +830,25 @@ bool Instance::IsFormatSupported(const vk::Format format,
         return true;
     }
     return (GetFormatFeatureFlags(format) & flags) == flags;
+}
+
+ImageFormatCache::Result Instance::GetImageFormatProperties(
+    const vk::PhysicalDeviceImageFormatInfo2& info) const {
+    static const bool disabled = [] {
+        const char* value = std::getenv("SHADPS4_DISABLE_IMAGE_QUERY_CACHE");
+        return value != nullptr && value[0] == '1';
+    }();
+    const auto query = [&](const auto& input) {
+        const auto result = physical_device.getImageFormatProperties2(input);
+        if (result.result == vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR(Render_Vulkan,
+                      "image format {} type {} is not supported (flags {}, usage {})",
+                      vk::to_string(input.format), vk::to_string(input.type),
+                      vk::to_string(input.flags), vk::to_string(input.usage));
+        }
+        return result;
+    };
+    return disabled ? query(info) : image_format_cache.Get(info, query);
 }
 
 vk::Format Instance::GetSupportedFormat(const vk::Format format,

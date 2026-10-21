@@ -60,6 +60,9 @@ public:
     void OnButton(Libraries::Pad::OrbisPadButtonDataOffset, bool);
     void OnAxis(Axis, int, u64 timestamp, bool smooth = true);
     void OnTouchpad(int touchIndex, bool isDown, float x, float y);
+    void OnTwoFingerTouchpad(bool down, u8& next_id);
+    void OnTouchpadButton(int index, bool down, float x, u8& next_id);
+    void OnSwipeTouchpad(int direction, float progress);
     void OnGyro(const float[3]);
     void OnAccel(const float[3]);
     void UpdateAxisSmoothing(u64 timestamp);
@@ -105,6 +108,9 @@ public:
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
+    void SetTwoFingerTouchpadState(bool down);
+    void SetTouchpadButtonState(int index, bool down, float x);
+    void StartTouchpadSwipe(int direction);
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
@@ -118,6 +124,9 @@ private:
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
     u64 m_last_orientation_update{};
+    u64 m_last_touch_trace{};
+    std::optional<int> m_swipe_direction;
+    u64 m_swipe_start{};
     Colour colour;
     std::optional<Colour> override_colour{};
 
@@ -126,6 +135,10 @@ private:
     std::mutex m_state_mutex;
     RingBufferQueue<State> m_states_queue;
 };
+
+constexpr u8 SelectTouchpadTarget(u8 index, bool bridge, bool source_has_touch, bool primary_has_touch) {
+    return index < 5 && index != 0 && bridge && source_has_touch && !primary_has_touch ? 0 : index;
+}
 
 class GameControllers {
     std::array<GameController*, 5> controllers;
@@ -143,6 +156,7 @@ public:
     }
     void TryOpenSDLControllers();
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
+    u8 GetTouchpadTargetFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);
 

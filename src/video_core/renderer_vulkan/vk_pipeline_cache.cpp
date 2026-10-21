@@ -13,6 +13,7 @@
 #include <xxhash.h>
 
 #include "common/hash.h"
+#include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_stats.h"
@@ -33,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/driver_cache_data.h"
 
 namespace Vulkan {
 
@@ -717,21 +719,71 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
              "Compute shader LDS barriers for multi wave workgroups: {}, buffer memory barriers "
              "within split GCN waves: {}",
              lds_multi_wave, profile.wave_memory_barriers);
-    WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    // Populate the actual Vulkan cache before preloading known pipelines, so both the
+    // preload and later new variations can reuse driver compilation data.
+    driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+        (std::filesystem::path{Common::ElfInfo::Instance().GameSerial()}.filename().string() + ".vkcache");
+    std::vector<u8> stored;
+    std::span<const u8> initial;
+    const auto properties = instance.GetPhysicalDevice().getProperties();
+    if (EmulatorSettings.IsPipelineCacheEnabled() && std::filesystem::exists(driver_cache_path)) {
+        Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Read};
+        if (file.IsOpen() && file.GetSize() <= 256ULL * 1024 * 1024) {
+            stored.resize(file.GetSize());
+            file.Read(stored);
+            initial = UnpackDriverCache(stored, properties.vendorID, properties.deviceID,
+                {properties.pipelineCacheUUID.data(), properties.pipelineCacheUUID.size()});
+        }
+        LOG_INFO(Render_Vulkan, "Vulkan driver cache: {} bytes accepted for this device", initial.size());
+    }
+    const vk::PipelineCacheCreateInfo cache_info{
+        .initialDataSize = initial.size(), .pInitialData = initial.empty() ? nullptr : initial.data()};
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_info);
+    if (cache_result != vk::Result::eSuccess && !initial.empty()) {
+        LOG_WARNING(Render_Vulkan, "Stored Vulkan cache rejected; starting a fresh cache");
+        auto fallback = instance.GetDevice().createPipelineCacheUnique({});
+        cache_result = fallback.result;
+        cache = std::move(fallback.value);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
-
     const u32 num_compilers = std::clamp(std::thread::hardware_concurrency() / 4, 2U, 8U);
     compiler = std::make_unique<PipelineCompiler>(num_compilers);
+    const char* preload_option = std::getenv("SHADPS4_PARALLEL_PRELOAD");
+    parallel_preload = preload_option && preload_option[0] == '1';
+    WarmUp();
     LOG_INFO(Render_Vulkan, "Pipelines can be compiled by {} worker threads", num_compilers);
+    if (Storage::DataBase::Instance().IsOpened()) {
+        Storage::DataBase::Instance().SetBeforeClose([this] { SaveDriverCache(); });
+    }
 }
 
 PipelineCache::~PipelineCache() {
+    SaveDriverCache();
+    Storage::DataBase::Instance().SetBeforeClose({});
     // Workers reference the pipelines, stop them first.
     compiler.reset();
+}
+
+void PipelineCache::SaveDriverCache() {
+    if (driver_cache_saved || !EmulatorSettings.IsPipelineCacheEnabled() || !pipeline_cache) return;
+    if (compiler) compiler->WaitIdle();
+    const auto result = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if ((result.result != vk::Result::eSuccess && result.result != vk::Result::eIncomplete) ||
+        result.value.size() < 32 || result.value.size() > 256ULL * 1024 * 1024 - 24) {
+        LOG_WARNING(Render_Vulkan, "Vulkan driver cache snapshot unavailable");
+        return;
+    }
+    const auto envelope = PackDriverCache(result.value);
+    Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Create};
+    if (file.IsOpen() && file.Write(envelope) == envelope.size()) {
+        file.Flush();
+        driver_cache_saved = true;
+        LOG_INFO(Render_Vulkan, "Vulkan driver cache saved: {} bytes", result.value.size());
+    } else {
+        LOG_WARNING(Render_Vulkan, "Vulkan driver cache could not be saved");
+    }
 }
 
 void PipelineCache::CompileAsync(Pipeline* pipeline) {
@@ -744,6 +796,9 @@ void PipelineCache::CompileAsync(Pipeline* pipeline) {
         compiler->WaitFor(pipeline, std::chrono::microseconds{wait_us});
     }
 }
+
+void PipelineCache::QueuePreload(Pipeline* pipeline) { compiler->Submit(pipeline); }
+void PipelineCache::WaitPreload() { compiler->WaitIdle(); }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -809,6 +864,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
         const u64 start_ns = Common::Perf::NowNs();
         const bool defer =
+            !Common::Perf::GetTuning().tiered_compute_pipelines.load(std::memory_order_relaxed) &&
             Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) >= 2;
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -824,6 +880,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         }
         if (defer) {
             CompileAsync(pipeline);
+        }
+        if (pipeline->NeedsBackgroundOptimization()) {
+            // Its first handle is already complete and usable; no dispatch is skipped.
+            compiler->Submit(pipeline);
         }
         Common::Perf::Add(Common::Perf::PipelineStallNs, Common::Perf::NowNs() - start_ns);
         return pipeline;
@@ -1263,6 +1323,12 @@ bool VertexAttributesMatch(const InfoT& info, const Shader::RuntimeInfo& runtime
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    static const bool fast_lookup = [] {
+        const char* value = std::getenv("SHADPS4_FAST_STAGE_LOOKUP");
+        const bool enabled = value && value[0] == '1';
+        LOG_INFO(Render_Vulkan, "Fast stage lookup: {}", enabled);
+        return enabled;
+    }();
     Common::Perf::Add(Common::Perf::SpecCalls);
     // Scout: the stage lookup precomputed for this draw, if its inputs are those of the draw
     // the command processor is at (the scout decides from its own copy of the registers).
@@ -1286,21 +1352,27 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             Common::Perf::Add(Common::Perf::ScoutHits);
         }
     }
-    Shader::RuntimeInfo runtime_info = [&] {
+    const Shader::RuntimeInfo& current_runtime_info = [&]() -> const Shader::RuntimeInfo& {
         if (scouted != nullptr) {
             runtime_infos[u32(sw_stage)] = scouted->GetRuntimeInfo();
             return runtime_infos[u32(sw_stage)];
         }
         return BuildRuntimeInfo(hw_stage, sw_stage);
     }();
+    // BuildRuntimeInfo owns this storage; lookup-only paths do not mutate it.
+    // Retain the old copy path for A/B. Compilation always gets a private copy.
+    std::optional<Shader::RuntimeInfo> runtime_copy;
+    if (!fast_lookup) runtime_copy.emplace(current_runtime_info);
+    const auto& runtime_info = fast_lookup ? current_runtime_info : *runtime_copy;
     auto it_pgm = program_cache.find(params.hash);
     const bool new_program = it_pgm == program_cache.end();
     if (new_program) {
         auto new_program_ptr = std::make_unique<Program>(hw_stage, sw_stage, params);
         Program* const program = new_program_ptr.get();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        auto compile_runtime_info = runtime_info;
+        const auto module = CompileModule(program->info, compile_runtime_info, params.code, 0, binding);
+        auto spec = Shader::StageSpecialization(program->info, compile_runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -1353,6 +1425,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (memoize) {
         memo_key = scouted != nullptr ? scouted->memo_key
                                       : SpecializationKey(info, runtime_info, binding);
+        if (fast_lookup) {
+            Common::Perf::Add(Common::Perf::StageLastMemoChecks);
+            const auto recent = program->last_stage_lookup.Find(
+                memo_key, program->modules.size(), [&](u32 index) {
+                    return VertexAttributesMatch(info, runtime_info, program->modules[index].spec);
+                });
+            if (recent) {
+                Common::Perf::Add(Common::Perf::StageLastMemoHits);
+                Common::Perf::Add(Common::Perf::SpecMemoHits);
+                info.AddBindings(binding);
+                auto& perm = program->modules[*recent];
+                if (auto& fetch = perm.spec.fetch_shader_data; !fetch.Empty()) fetch_shader = &fetch;
+                return std::make_tuple(&program->info, perm.module,
+                                       HashCombine(params.hash, u64{*recent}));
+            }
+        }
         for (const auto& entry : program->memo) {
             // The command processor is the only writer: plain (relaxed) reads.
             const u32 entry_perm = entry.perm_idx.load(std::memory_order_relaxed);
@@ -1361,6 +1449,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 entry_perm < program->modules.size() &&
                 VertexAttributesMatch(info, runtime_info, program->modules[entry_perm].spec)) {
                 Common::Perf::Add(Common::Perf::SpecMemoHits);
+                if (fast_lookup) program->last_stage_lookup.Remember(memo_key, entry_perm);
                 info.AddBindings(binding);
                 auto& perm = program->modules[entry_perm];
                 if (auto& fetch = perm.spec.fetch_shader_data; !fetch.Empty()) {
@@ -1382,7 +1471,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto compile_runtime_info = runtime_info;
+        module = CompileModule(new_info, compile_runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         // The scout thread reads the permutations of the program (shared lock).

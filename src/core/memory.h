@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include <atomic>
 
 #include <map>
 #include <mutex>
@@ -363,6 +364,7 @@ private:
     PhysMap dmem_map;
     PhysMap fmem_map;
     VMAMap vma_map;
+    std::atomic<u64> vma_generation{1};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};

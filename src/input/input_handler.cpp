@@ -277,6 +277,8 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
         return OPBDO::TouchPad;
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER:
+        return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_BACK:
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
@@ -740,16 +742,23 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     if (button != SDL_GAMEPAD_BUTTON_INVALID) {
         switch (button) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT:
-            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->SetTouchpadButtonState(0, new_button_state, 0.25f);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
-            controller->SetTouchpadState(0, new_button_state, 0.50f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->SetTouchpadButtonState(0, new_button_state, 0.50f);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
-            controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->SetTouchpadButtonState(1, new_button_state, 0.75f);
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER:
+            controller->SetTwoFingerTouchpadState(new_button_state);
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+            if (new_button_state)
+                controller->StartTouchpadSwipe(button - SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP);
             break;
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;

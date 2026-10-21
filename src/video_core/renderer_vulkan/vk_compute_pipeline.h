@@ -52,8 +52,12 @@ public:
     ~ComputePipeline() override;
 
     void Compile() override;
+    bool NeedsBackgroundOptimization() const noexcept { return tiered; }
 
 private:
+    void CompileVariant(bool fast);
+    vk::UniquePipeline optimized_pipeline;
+    bool tiered{};
     ComputePipelineKey compute_key;
     vk::ShaderModule module;
     vk::PipelineCache vk_pipeline_cache;

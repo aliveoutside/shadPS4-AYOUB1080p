@@ -8,6 +8,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/pipeline_handle_choice.h"
 
 #include <boost/container/small_vector.hpp>
 
@@ -35,7 +36,7 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
-        return *pipeline;
+        return vk::Pipeline{replacement.Select(static_cast<VkPipeline>(*pipeline))};
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
@@ -78,11 +79,17 @@ public:
         return ready.load(std::memory_order_acquire);
     }
 
-    /// Creates the Vulkan pipeline object when the constructor deferred it. Called exactly once,
-    /// from any thread, while no other thread uses the pipeline.
+    /// Creates a deferred pipeline, or optimizes an already-ready tiered compute pipeline.
+    /// Only one worker may compile a given pipeline; a published initial handle stays alive.
     virtual void Compile() = 0;
 
 protected:
+    void PublishReplacement(vk::Pipeline handle) noexcept {
+        replacement.Publish(static_cast<VkPipeline>(handle));
+    }
+    // The initial pipeline remains alive after publishing a replacement: queued GPU
+    // commands may still refer to its handle.
+    PipelineHandleChoice<VkPipeline> replacement;
     [[nodiscard]] std::string GetDebugString() const;
 
     void MarkReady() noexcept {

@@ -60,10 +60,48 @@ void State::OnGyro(const float gyro[3]) {
     angularVelocity.z = gyro[2];
 }
 
+void State::OnTouchpadButton(int index, bool down, float x, u8& next_id) {
+    if (index < 0 || index >= 2) return;
+    auto& touch = touchpad[index];
+    if (down && !touch.state) {
+        touch.ID = next_id;
+        next_id = next_id == 127 ? 1 : next_id + 1;
+    }
+    OnTouchpad(index, down, x, 0.5f);
+    OnButton(OrbisPadButtonDataOffset::TouchPad, touchpad[0].state || touchpad[1].state);
+}
+
+void State::OnTwoFingerTouchpad(bool down, u8& next_id) {
+    for (int i = 0; i < 2; ++i) {
+        auto& touch = touchpad[i];
+        if (down && !touch.state) {
+            touch.ID = next_id;
+            next_id = next_id == 127 ? 1 : next_id + 1;
+        }
+        OnTouchpad(i, down, i == 0 ? 0.25f : 0.75f, 0.5f);
+    }
+    OnButton(OrbisPadButtonDataOffset::TouchPad, down);
+}
+
 void State::OnAccel(const float accel[3]) {
     acceleration.x = accel[0];
     acceleration.y = accel[1];
     acceleration.z = accel[2];
+}
+
+void State::OnSwipeTouchpad(int direction, float progress) {
+    const float t = std::clamp(progress, 0.0f, 1.0f);
+    float x = 0.5f, y = 0.5f;
+    switch (direction) {
+    case 0: y = 0.85f - 0.70f * t; break; // up
+    case 1: y = 0.15f + 0.70f * t; break; // down
+    case 2: x = 0.85f - 0.70f * t; break; // left
+    case 3: x = 0.15f + 0.70f * t; break; // right
+    default: return;
+    }
+    OnTouchpad(0, t < 1.0f, x, y);
+    touchpad[1].state = false;
+    OnButton(OrbisPadButtonDataOffset::TouchPad, false);
 }
 
 void State::UpdateAxisSmoothing(u64 timestamp) {

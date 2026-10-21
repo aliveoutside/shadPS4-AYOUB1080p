@@ -4,6 +4,7 @@
 #include <xxhash.h>
 
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 #include "common/debug.h"
 #include "common/io_file.h"
@@ -13,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -25,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/renderer_vulkan/descriptor_write_storage.h"
 
 namespace Vulkan {
 
@@ -1283,7 +1286,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     set_write_index = 0;
-    set_writes.clear();
+    static const bool reuse_descriptor_storage = [] {
+        const char* value = std::getenv("SHADPS4_REUSE_DESCRIPTOR_STORAGE");
+        const bool enabled = value && value[0] == '1';
+        LOG_INFO(Render_Vulkan, "Descriptor storage reuse: {}", enabled);
+        return enabled;
+    }();
+    size_t write_count = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) {
+            write_count += stage->buffers.size() + stage->images.size() + stage->samplers.size();
+        }
+    }
+    PrepareDescriptorWrites(set_writes, write_count, reuse_descriptor_storage);
     buffer_infos.clear();
     image_infos.clear();
 
@@ -1296,8 +1311,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         if (!stage) {
             continue;
         }
-        set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
-                          stage->samplers.size());
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
@@ -1306,6 +1319,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
     }
+
+    ASSERT(set_write_index == set_writes.size());
 
     return true;
 }
@@ -1372,10 +1387,14 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        bool known_unwritten = false;
+        const bool reuse_check = Common::Perf::GetTuning().reuse_buffer_checks.load(std::memory_order_relaxed);
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false,
+                                     reuse_check ? &known_unwritten : nullptr);
         if (range.buffer != &buffer_cache.GetStreamBuffer()) {
-            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+            if (known_unwritten) Common::Perf::Add(Common::Perf::BufferChecksReused);
+            else needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
         }
         if (g_dump.frames_left != 0) [[unlikely]] {
             if (dump_vertex_ranges.size() < dump_vertex_ranges.capacity()) {
@@ -1440,10 +1459,14 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    bool known_unwritten = false;
+    const bool reuse_check = Common::Perf::GetTuning().reuse_buffer_checks.load(std::memory_order_relaxed);
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false,
+                                 reuse_check ? &known_unwritten : nullptr);
     if (buffer != &buffer_cache.GetStreamBuffer()) {
-        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        if (known_unwritten) Common::Perf::Add(Common::Perf::BufferChecksReused);
+        else needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     }
     const auto cmdbuf = scheduler.Recorder();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
@@ -1565,10 +1588,11 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         return false;
     }
 
-    // Ensure shader only has 2 bound buffers
+    // Two data buffers, optionally followed by the flattened user-data buffer.
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
-    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
+    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() < 2 || info.buffers.size() > 3 ||
+        !info.images.empty()) {
         return false;
     }
 
@@ -1576,6 +1600,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     const auto& desc0 = info.buffers[0];
     const auto& desc1 = info.buffers[1];
     if (!desc0.is_formatted || !desc1.is_formatted || desc0.is_written == desc1.is_written) {
+        return false;
+    }
+    if (info.buffers.size() == 3 && info.buffers[2].buffer_type != Shader::BufferType::Flatbuf) {
         return false;
     }
 
@@ -1618,10 +1645,11 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         return false;
     }
 
-    // Ensure shader only has 2 bound buffers
+    // Two data buffers, optionally followed by the flattened user-data buffer.
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
-    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
+    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() < 2 || info.buffers.size() > 3 ||
+        !info.images.empty()) {
         return false;
     }
 
@@ -1629,6 +1657,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const auto& desc0 = info.buffers[0];
     const auto& desc1 = info.buffers[1];
     if (desc0.is_formatted || !desc1.is_formatted || desc0.is_written || !desc1.is_written) {
+        return false;
+    }
+    if (info.buffers.size() == 3 && info.buffers[2].buffer_type != Shader::BufferType::Flatbuf) {
         return false;
     }
 
@@ -1861,8 +1892,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                bool known_unwritten = false;
+                const bool reuse_check = Common::Perf::GetTuning().reuse_buffer_checks.load(std::memory_order_relaxed);
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted,
+                    reuse_check ? &known_unwritten : nullptr);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1883,19 +1917,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (buffer != &buffer_cache.GetStreamBuffer()) {
                     bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
                                                vsharp.base_address);
-                    needs_barrier |=
-                        Rt().IsBufferAccessed(buffer, offset, size, desc.is_written);
+                    if (known_unwritten) Common::Perf::Add(Common::Perf::BufferChecksReused);
+                    else needs_barrier |= Rt().IsBufferAccessed(buffer, offset, size, desc.is_written);
                 }
             }
         }
 
         auto& set_write = set_writes[set_write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
-        set_write.pBufferInfo = &buffer_infos.back();
+        WriteBufferDescriptor(set_write, binding.unified++, &buffer_infos.back());
         ++binding.buffer;
     }
 }
@@ -2166,13 +2195,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         auto& set_write = set_writes[set_write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = array_size;
-        set_write.descriptorType =
-            is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
-        set_write.pImageInfo = &image_infos[image_info_idx];
+        WriteImageDescriptor(set_write, binding.unified, array_size,
+                             is_storage ? vk::DescriptorType::eStorageImage
+                                        : vk::DescriptorType::eSampledImage,
+                             &image_infos[image_info_idx]);
 
         image_info_idx += array_size;
         image_binding_idx += array_size;
@@ -2231,12 +2257,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eSampler;
-        set_write.pImageInfo = &image_infos.back();
+        WriteImageDescriptor(set_write, binding.unified++, 1, vk::DescriptorType::eSampler,
+                             &image_infos.back());
     }
 }
 
@@ -2925,8 +2947,14 @@ void Rasterizer::UpdateDepthStencilState() const {
         if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
             (back_op && regs.depth_control.backface_enable &&
              ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
+            // This limitation can occur on hundreds of draws per frame. Preserve the diagnostic
+            // without formatting and enqueueing the same warning on every affected draw.
+            static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+            if (!warned.test(std::memory_order_relaxed) &&
+                !warned.test_and_set(std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
+                                           "op_val; the stencil test will use op_val (reported once)");
+            }
         }
         dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
                                            back_op ? back.stencil_op_val : back.stencil_test_val);
