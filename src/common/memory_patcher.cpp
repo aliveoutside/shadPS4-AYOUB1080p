@@ -238,12 +238,8 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 // Fixes built into this build for the games it is tuned for. They do not depend on the patch
 // files or on the launcher: each one is checked against the code of the game (FNV-1a 64 hash of
 // the bytes it replaces) and left out on another version of the game, or when a patch already
-// made the same change. SHADPS4_GAME_PROFILE=0 disables them, with the game profile.
+// made the same change.
 static void ApplyBuiltInFixes() {
-    const char* profile = std::getenv("SHADPS4_GAME_PROFILE");
-    if (profile != nullptr && std::string_view{profile} == "0") {
-        return;
-    }
     struct BuiltInFix {
         std::string_view serial;
         std::string_view name;

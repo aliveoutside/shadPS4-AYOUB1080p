@@ -265,20 +265,6 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
     m_states_queue.Push(m_state);
-    static const bool trace = [] {
-        const char* value = std::getenv("SHADPS4_TRACE_TOUCH");
-        return value != nullptr && value[0] == '1';
-    }();
-    const u64 trace_interval = m_state.touchpad[0].state || m_state.touchpad[1].state ? 100'000 : 500'000;
-    if (trace && timestamp - m_last_touch_trace >= trace_interval) {
-        m_last_touch_trace = timestamp;
-        LOG_INFO(Input,
-                 "Touch report user={} contacts={} click={} id0={} xy0={},{} id1={} xy1={},{}",
-                 user_id, int(m_state.touchpad[0].state) + int(m_state.touchpad[1].state),
-                 bool(m_state.buttonsState & OrbisPadButtonDataOffset::TouchPad),
-                 m_state.touchpad[0].ID, m_state.touchpad[0].x, m_state.touchpad[0].y,
-                 m_state.touchpad[1].ID, m_state.touchpad[1].x, m_state.touchpad[1].y);
-    }
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {
@@ -339,17 +325,6 @@ void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
     int controller_count;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
-    // Opt-in at startup: the virtual Sony pad carries PhonePad's touch/motion and also
-    // the physical Xbox buttons. Reserve player 1 for it when both are already present.
-    if (const char* value = std::getenv("SHADPS4_PREFER_TOUCHPAD");
-        value != nullptr && value[0] == '1' && controller_count > 1) {
-        const auto preferred = [](SDL_JoystickID id) {
-            const auto type = SDL_GetGamepadTypeForID(id);
-            return type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5;
-        };
-        std::stable_sort(new_joysticks, new_joysticks + controller_count,
-                         [&](auto a, auto b) { return preferred(a) > preferred(b); });
-    }
     LOG_INFO(Input, "{} controllers are currently connected", controller_count);
 
     std::unordered_set<SDL_JoystickID> assigned_ids;
@@ -459,10 +434,7 @@ u8 GameControllers::GetTouchpadTargetFromJoystickId(SDL_JoystickID id) {
     if (!source_pad) return 255;
     const u8 index = GetGamepadIndexFromJoystickId(id);
     if (index >= 5) return index;
-    static const bool bridge = [] {
-        const char* value = std::getenv("SHADPS4_PREFER_TOUCHPAD");
-        return value != nullptr && value[0] == '1';
-    }();
+    constexpr bool bridge = false;
     // Preserve player-1 buttons/axes on the Xbox. Supplement only touch/motion/click
     // from the virtual pad, including when it connects after the game has started.
     const bool source_has_touch = SDL_GetNumGamepadTouchpads(controllers[index]->m_sdl_gamepad) > 0;

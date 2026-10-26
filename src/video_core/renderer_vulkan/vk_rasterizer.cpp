@@ -1286,12 +1286,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     set_write_index = 0;
-    static const bool reuse_descriptor_storage = [] {
-        const char* value = std::getenv("SHADPS4_REUSE_DESCRIPTOR_STORAGE");
-        const bool enabled = value && value[0] == '1';
-        LOG_INFO(Render_Vulkan, "Descriptor storage reuse: {}", enabled);
-        return enabled;
-    }();
+    constexpr bool reuse_descriptor_storage = false;
     size_t write_count = 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (stage) {

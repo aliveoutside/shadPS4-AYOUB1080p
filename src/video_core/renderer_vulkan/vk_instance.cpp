@@ -834,10 +834,6 @@ bool Instance::IsFormatSupported(const vk::Format format,
 
 ImageFormatCache::Result Instance::GetImageFormatProperties(
     const vk::PhysicalDeviceImageFormatInfo2& info) const {
-    static const bool disabled = [] {
-        const char* value = std::getenv("SHADPS4_DISABLE_IMAGE_QUERY_CACHE");
-        return value != nullptr && value[0] == '1';
-    }();
     const auto query = [&](const auto& input) {
         const auto result = physical_device.getImageFormatProperties2(input);
         if (result.result == vk::Result::eErrorFormatNotSupported) {
@@ -848,7 +844,7 @@ ImageFormatCache::Result Instance::GetImageFormatProperties(
         }
         return result;
     };
-    return disabled ? query(info) : image_format_cache.Get(info, query);
+    return image_format_cache.Get(info, query);
 }
 
 vk::Format Instance::GetSupportedFormat(const vk::Format format,

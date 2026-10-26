@@ -341,13 +341,7 @@ static HostOverrideState LoadHostOverrideState() {
     HostOverrideState s;
     s.loaded = true;
     std::filesystem::path path;
-    if (const char* path_env = std::getenv("SHADPS4_HTTP_HOST_OVERRIDES_JSON");
-        path_env && path_env[0]) {
-        // Explicit override path - useful for dev / testing.
-        path = path_env;
-    } else {
-        path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "host_overrides.json";
-    }
+    path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "host_overrides.json";
     std::ifstream f(path);
     if (!f.is_open()) {
         return s;

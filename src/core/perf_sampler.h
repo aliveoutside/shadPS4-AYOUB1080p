@@ -11,7 +11,6 @@ namespace Core::PerfSampler {
  * Starts a background thread that reports, once per second, the CPU usage of the busiest
  * emulator threads, and periodically a statistical profile of where those threads spend their
  * time (sampled instruction addresses, grouped by function). Windows only, no-op elsewhere.
- * Set the environment variable SHADPS4_PERF_SAMPLER=0 to disable it.
  */
 void Start();
 
@@ -20,7 +19,7 @@ void Stop();
 
 /**
  * Settings measured on some games, applied at startup before perf_tuning.ini (which can change
- * any of them): inFAMOUS Second Son (CUSA00004, CUSA00223). SHADPS4_GAME_PROFILE=0 disables it.
+ * any of them): inFAMOUS Second Son (CUSA00004, CUSA00223).
  */
 void ApplyGameProfile(std::string_view serial);
 

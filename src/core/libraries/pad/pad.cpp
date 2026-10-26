@@ -444,27 +444,6 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
     const int processed = ProcessStates(pData, states.data(), ret_num);
-    static const bool trace = [] {
-        const char* value = std::getenv("SHADPS4_TRACE_TOUCH");
-        return value != nullptr && value[0] == '1';
-    }();
-    static std::array<std::atomic<u64>, 5> last_trace{};
-    if (trace && processed > 0 && handle > 0 && handle <= 5) {
-        const auto& report = pData[processed - 1];
-        auto& last = last_trace[handle - 1];
-        u64 previous = last.load(std::memory_order_relaxed);
-        const u64 interval = report.touchData.touchNum > 0 ? 100'000 : 500'000;
-        if (report.timestamp - previous >= interval &&
-            last.compare_exchange_strong(previous, report.timestamp, std::memory_order_relaxed)) {
-            LOG_INFO(Lib_Pad,
-                     "Guest touch handle={} contacts={} click={} id0={} xy0={},{} id1={} xy1={},{}",
-                     handle, report.touchData.touchNum,
-                     bool(report.buttons & OrbisPadButtonDataOffset::TouchPad),
-                     report.touchData.touch[0].id, report.touchData.touch[0].x,
-                     report.touchData.touch[0].y, report.touchData.touch[1].id,
-                     report.touchData.touch[1].x, report.touchData.touch[1].y);
-        }
-    }
     return processed;
 }
 

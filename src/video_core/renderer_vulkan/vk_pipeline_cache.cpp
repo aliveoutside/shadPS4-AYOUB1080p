@@ -750,8 +750,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
     const u32 num_compilers = std::clamp(std::thread::hardware_concurrency() / 4, 2U, 8U);
     compiler = std::make_unique<PipelineCompiler>(num_compilers);
-    const char* preload_option = std::getenv("SHADPS4_PARALLEL_PRELOAD");
-    parallel_preload = preload_option && preload_option[0] == '1';
     WarmUp();
     LOG_INFO(Render_Vulkan, "Pipelines can be compiled by {} worker threads", num_compilers);
     if (Storage::DataBase::Instance().IsOpened()) {
@@ -1323,12 +1321,7 @@ bool VertexAttributesMatch(const InfoT& info, const Shader::RuntimeInfo& runtime
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    static const bool fast_lookup = [] {
-        const char* value = std::getenv("SHADPS4_FAST_STAGE_LOOKUP");
-        const bool enabled = value && value[0] == '1';
-        LOG_INFO(Render_Vulkan, "Fast stage lookup: {}", enabled);
-        return enabled;
-    }();
+    constexpr bool fast_lookup = false;
     Common::Perf::Add(Common::Perf::SpecCalls);
     // Scout: the stage lookup precomputed for this draw, if its inputs are those of the draw
     // the command processor is at (the scout decides from its own copy of the registers).

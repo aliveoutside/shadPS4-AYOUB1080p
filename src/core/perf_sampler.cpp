@@ -33,14 +33,9 @@ namespace {
 
 void ApplyGameProfile(std::string_view serial) {
     // inFAMOUS Second Son (US, EU): settings measured on this game. perf_tuning.ini can change
-    // any of them, SHADPS4_GAME_PROFILE=0 leaves the emulator defaults.
+    // any of them.
     constexpr std::array<std::string_view, 2> InfamousSecondSon{"CUSA00004", "CUSA00223"};
     if (std::ranges::find(InfamousSecondSon, serial) == InfamousSecondSon.end()) {
-        return;
-    }
-    if (const char* setting = std::getenv("SHADPS4_GAME_PROFILE");
-        setting != nullptr && setting[0] == '0') {
-        LOG_INFO(Debug, "Game profile of {} not applied (SHADPS4_GAME_PROFILE=0)", serial);
         return;
     }
     auto& t = Common::Perf::GetTuning();
@@ -832,8 +827,7 @@ public:
 
     void Run(const std::stop_token& stop) {
         Common::SetCurrentThreadName("shadPS4:PerfSampler");
-        const char* sample_setting = std::getenv("SHADPS4_CPU_SAMPLING");
-        const bool sample_cpu = sample_setting == nullptr || sample_setting[0] != '0';
+        constexpr bool sample_cpu = true;
         SetThreadPriority(GetCurrentThread(), sample_cpu ? THREAD_PRIORITY_HIGHEST
                                                         : THREAD_PRIORITY_NORMAL);
         HANDLE timer = CreateWaitableTimerExW(
@@ -1666,11 +1660,6 @@ private:
 } // namespace
 
 void Start() {
-    if (const char* setting = std::getenv("SHADPS4_PERF_SAMPLER");
-        setting != nullptr && setting[0] == '0') {
-        LOG_INFO(Debug, "Perf sampler disabled by SHADPS4_PERF_SAMPLER");
-        return;
-    }
     if (g_thread.joinable()) {
         return;
     }

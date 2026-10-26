@@ -25,7 +25,7 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 /**
  * Protocol summary:
- * - IPC is enabled by setting the SHADPS4_ENABLE_IPC environment variable to "true"
+ * - IPC is disabled in this build
  * - Input will be stdin & output stderr
  * - Strings are sent as UTF8
  * - Each communication line is terminated by a newline character ('\n')
@@ -66,8 +66,7 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  **/
 
 void IPC::Init() {
-    const char* enabledEnv = std::getenv("SHADPS4_ENABLE_IPC");
-    enabled = enabledEnv && strcmp(enabledEnv, "true") == 0;
+    enabled = false;
     if (!enabled) {
         return;
     }
